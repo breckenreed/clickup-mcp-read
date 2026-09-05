@@ -1,13 +1,57 @@
-# clickup-mcp-full
+# clickup-mcp-read
 
-A ClickUp MCP server that can read a whole nested subtask tree — or a task's
-whole activity history — in **one call**.
+A **strictly read-only** ClickUp MCP server. It answers questions about a
+workspace — including a whole nested subtask tree, or a task's whole activity
+history, in **one call** — and it cannot change anything.
 
-It wraps [`@twofeetup/clickup-mcp`](https://www.npmjs.com/package/@twofeetup/clickup-mcp)
-rather than forking it, so upstream fixes arrive with a dependency bump. On top
-of that server it adds `get_task_tree` and `get_task_activity`, rewrites one
-tool description that reliably misleads smaller models, and pins a sensible
-default tool set.
+This is [`clickup-mcp-full`](https://github.com/breckenreed/clickup-mcp-full)
+with every write path removed. Like that server, it wraps
+[`@twofeetup/clickup-mcp`](https://www.npmjs.com/package/@twofeetup/clickup-mcp)
+rather than forking it, so upstream fixes arrive with a dependency bump.
+
+Use it for agents that should analyse, report on, or plan against ClickUp —
+standups, audits, roadmap questions, "what changed last week" — without any
+chance of a stray tool call editing a task.
+
+## What it cannot do
+
+Refused outright, at three independent layers: **create, update, delete, move
+or duplicate a task; create, update or delete a list or folder; post a comment;
+start, stop, add or delete a time entry; create, rename or delete a tag, or add
+one to a task; upload an attachment; create or edit a document.**
+
+## Why this is a separate server rather than a flag
+
+Upstream consolidated nineteen tools into a handful of multi-action ones, so
+the read/write line does not fall between tools — it falls *inside* them.
+`task_comments` both reads comments and posts them. `task_time_tracking` both
+reports time and starts timers. `operate_tags` both lists tags and deletes
+them. A tool allowlist cannot express "reads only"; the unit that has to be
+filtered is the **(tool, action) pair**, and that filtering has to live
+somewhere the calling agent cannot reach.
+
+Three layers hold the line, so no single mistake opens a write:
+
+1. **The child never registers the write tools.** The wrapped server is started
+   with `ENABLED_TOOLS` pinned to the read-capable set, so `manage_task` and
+   friends have no handler at all.
+2. **Every call is checked here first.** A `tools/call` is matched against the
+   tool allowlist *and* the per-tool action allowlist before it is forwarded —
+   so a client that names a tool it was never offered is still refused.
+3. **The advertised schema is pruned.** `tools/list` drops the write tools,
+   strips write actions out of each surviving `action` enum, and removes the
+   parameters that exist only to carry a write. An agent is never shown an
+   affordance it would then be denied.
+
+The two tools implemented in this server reach ClickUp through a single helper
+that hardcodes `GET` and takes a path, not a method, so they cannot become
+writes either.
+
+> **This is not a substitute for a read-only token.** ClickUp issues one
+> personal token with the full rights of the user who created it; anything else
+> holding that token can still write. This bounds what *this server* will do
+> with it. For a hard guarantee, create the token under a view-only ClickUp
+> account and use it here.
 
 ## Why the subtask tree
 
@@ -75,10 +119,10 @@ first launch.
 **Claude Code**
 
 ```bash
-claude mcp add clickup_full_local \
+claude mcp add clickup_read \
   --env CLICKUP_API_KEY=pk_your_token \
   --env CLICKUP_TEAM_ID=9012345678 \
-  -- npx -y github:breckenreed/clickup-mcp-full
+  -- npx -y github:breckenreed/clickup-mcp-read
 ```
 
 **Claude Desktop, Cursor, Windsurf, or any client using `mcpServers` JSON**
@@ -86,9 +130,9 @@ claude mcp add clickup_full_local \
 ```json
 {
   "mcpServers": {
-    "clickup_full_local": {
+    "clickup_read": {
       "command": "npx",
-      "args": ["-y", "github:breckenreed/clickup-mcp-full"],
+      "args": ["-y", "github:breckenreed/clickup-mcp-read"],
       "env": {
         "CLICKUP_API_KEY": "pk_your_token",
         "CLICKUP_TEAM_ID": "9012345678"
@@ -102,9 +146,9 @@ claude mcp add clickup_full_local \
 
 ```yaml
 mcp_servers:
-  clickup_full_local:
+  clickup_read:
     command: npx
-    args: ["-y", "github:breckenreed/clickup-mcp-full"]
+    args: ["-y", "github:breckenreed/clickup-mcp-read"]
     env:
       CLICKUP_API_KEY: "${CLICKUP_API_KEY}"
       CLICKUP_TEAM_ID: "${CLICKUP_TEAM_ID}"
@@ -116,10 +160,13 @@ mcp_servers:
 **Global install**, if you would rather not resolve from GitHub on every launch:
 
 ```bash
-npm install -g github:breckenreed/clickup-mcp-full
+npm install -g github:breckenreed/clickup-mcp-read
 ```
 
-then use `clickup-mcp-full` as the command with no arguments.
+then use `clickup-mcp-read` as the command with no arguments.
+
+Running this alongside `clickup-mcp-full` is fine — give them different server
+names and the agent sees two distinct tool sets.
 
 ## Credentials
 
@@ -128,44 +175,36 @@ then use `clickup-mcp-full` as the command with no arguments.
 | `CLICKUP_API_KEY` | ClickUp, Settings, Apps, API Token. Starts with `pk_`. |
 | `CLICKUP_TEAM_ID` | The number in your ClickUp URL, or `curl -H "Authorization: $CLICKUP_API_KEY" https://api.clickup.com/api/v2/team` and read `.teams[].id`. |
 
-A ClickUp personal token has no scopes of its own. It acts as the user who
-created it and inherits that user's permissions, so if you want an agent that
-cannot write, create the token under a view-only ClickUp account rather than
-relying on tool selection.
-
 ## Tools
 
-| Tool | Access | What it does |
-|---|---|---|
-| `get_task_tree` | read | Task plus all nested subtasks, any depth, one call |
-| `get_task_activity` | read | Full history of a task: system events plus comments |
-| `get_workspace_hierarchy` | read | Spaces, folders, lists as a tree |
-| `search_tasks` | read | One task by id, one list, or workspace-wide filters |
-| `get_container` | read | Details of a single list or folder |
-| `find_members` | read | Resolve a name or email to an assignee id |
-| `task_comments` | read, write | Get and add comments (use `get_task_activity` to read) |
-| `manage_task` | write | Create, update, delete, move, duplicate |
-| `manage_container` | write | Create, update, delete lists and folders |
-| `operate_tags` | read, write | List, create, update, delete tags |
-| `task_time_tracking` | read, write | Get, start, stop, add, delete entries |
+Every tool here is read-only. Nine are exposed by default.
 
-Upstream also ships `attach_file_to_task`, which uploads a local file into
-ClickUp. It is **off by default** here: for an agent that runs without
-per-action confirmation, it turns any prompt injection the agent reads into a
-data-egress path. Enable it deliberately if you need it:
+| Tool | What it does |
+|---|---|
+| `get_task_tree` | Task plus all nested subtasks, any depth, one call |
+| `get_task_activity` | Full history of a task: system events plus comments |
+| `get_workspace_hierarchy` | Spaces, folders, lists as a tree |
+| `search_tasks` | One task by id, one list, or workspace-wide filters |
+| `get_container` | Details of a single list or folder |
+| `find_members` | Resolve a name or email to an assignee id |
+| `task_comments` | Read comments (`get` only) |
+| `task_time_tracking` | Read time entries (`get_entries`, `get_current`) |
+| `operate_tags` | List the tags in a space (`list` only, space scope) |
 
-```
-ENABLED_TOOLS=get_workspace_hierarchy,search_tasks,manage_task,task_comments,get_container,manage_container,find_members,operate_tags,task_time_tracking,attach_file_to_task
-```
+With `DOCUMENT_SUPPORT=true`, two more appear: `list_documents`, and
+`manage_document_page` narrowed to its `get` and `list` actions.
+
+Upstream's `manage_task`, `manage_container`, `attach_file_to_task` and
+`manage_document` are **not present and cannot be enabled**.
 
 ## Options
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ENABLED_TOOLS` | the nine upstream tools above | Comma-separated allowlist. Overrides the default set. `get_task_tree` and `get_task_activity` are implemented here, so they are always available. |
-| `DISABLED_TOOLS` | unset | Comma-separated blocklist. Ignored when `ENABLED_TOOLS` is set. |
+| `ENABLED_TOOLS` | the nine tools above | Comma-separated allowlist. May only **narrow** the read-only set; write tools listed here are ignored with a warning on stderr. `get_task_tree` and `get_task_activity` are implemented here, so they are always available. |
+| `DISABLED_TOOLS` | unset | Comma-separated blocklist. Only ever subtracts. |
 | `REQUEST_SPACING` | `100` | Milliseconds between ClickUp API calls. See below. |
-| `DOCUMENT_SUPPORT` | `false` | `true` exposes upstream's document tools. |
+| `DOCUMENT_SUPPORT` | `false` | `true` exposes the two read-only document tools. |
 
 **Raise `REQUEST_SPACING` on a shared workspace.** The default allows about ten
 requests per second, while ClickUp's per-token limit is roughly 100 per minute
@@ -174,6 +213,11 @@ agent that exhausts it also breaks every other integration running under the
 same token. `700` keeps you under a 100 per minute ceiling.
 
 ## Notes on behaviour
+
+**Refusals are tool errors, not transport errors.** A blocked call comes back
+as a normal tool result with `isError` and a sentence saying the server is
+read-only and the write is not possible here. Agents read that and move on;
+a JSON-RPC error tends to get retried.
 
 **Subtasks in another list.** The tree is built by walking the list that
 contains the root task. If your workspace places subtasks in a different list
@@ -207,7 +251,7 @@ globally inside the image instead and point `command:` at the binary.
 Check that the server starts and lists its tools:
 
 ```bash
-CLICKUP_API_KEY=pk_... CLICKUP_TEAM_ID=... npx -y github:breckenreed/clickup-mcp-full --help
+CLICKUP_API_KEY=pk_... CLICKUP_TEAM_ID=... npx -y github:breckenreed/clickup-mcp-read --help
 ```
 
 `Missing required environment` means the variables did not reach the process:

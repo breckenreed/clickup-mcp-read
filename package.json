@@ -1,10 +1,10 @@
 {
-  "name": "clickup-mcp-full",
+  "name": "clickup-mcp-read",
   "version": "1.0.0",
-  "description": "ClickUp MCP server with a one-call nested subtask tree. Wraps @twofeetup/clickup-mcp and adds get_task_tree.",
+  "description": "Strictly read-only ClickUp MCP server. Wraps @twofeetup/clickup-mcp, removes every write path, and adds get_task_tree and get_task_activity.",
   "type": "module",
   "bin": {
-    "clickup-mcp-full": "src/index.mjs"
+    "clickup-mcp-read": "src/index.mjs"
   },
   "main": "src/index.mjs",
   "files": [
@@ -22,17 +22,18 @@
     "clickup",
     "mcp",
     "model-context-protocol",
+    "read-only",
     "subtasks",
     "task-management",
     "ai-agent"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/breckenreed/clickup-mcp-full.git"
+    "url": "git+https://github.com/breckenreed/clickup-mcp-read.git"
   },
   "bugs": {
-    "url": "https://github.com/breckenreed/clickup-mcp-full/issues"
+    "url": "https://github.com/breckenreed/clickup-mcp-read/issues"
   },
-  "homepage": "https://github.com/breckenreed/clickup-mcp-full#readme",
+  "homepage": "https://github.com/breckenreed/clickup-mcp-read#readme",
   "license": "MIT"
 }

@@ -1,25 +1,53 @@
 #!/usr/bin/env node
 /**
- * clickup-mcp-full — ClickUp MCP server with a one-call nested subtask tree.
+ * clickup-mcp-read — a strictly read-only ClickUp MCP server.
  *
- * This is a thin stdio proxy in front of @twofeetup/clickup-mcp rather than a
- * fork of it. It spawns that server as a child, speaks the same newline-
- * delimited JSON-RPC in both directions, and changes exactly four things:
+ * This is clickup-mcp-full with every write path removed. It is a thin stdio
+ * proxy in front of @twofeetup/clickup-mcp: it spawns that server as a child,
+ * speaks the same newline-delimited JSON-RPC in both directions, and:
  *
- *   1. adds `get_task_tree`, implemented here, which reads a task and ALL of
+ *   1. refuses every tool and every tool action that can change anything in
+ *      ClickUp — see the read-only policy below;
+ *   2. adds `get_task_tree`, implemented here, which reads a task and ALL of
  *      its nested subtasks at every depth in one call;
- *   2. adds `get_task_activity`, which reads the full activity log of a task —
+ *   3. adds `get_task_activity`, which reads the full activity log of a task —
  *      every system event (status changes, due-date moves, assignees, tags,
  *      priority, custom fields, moves, attachments, ...) merged with the
  *      comments, in one chronological view;
- *   3. rewrites the `search_tasks` description, whose "Works 3 ways" phrasing
- *      reliably walks smaller models into a dead end (see below);
- *   4. defaults the exposed tool set to the nine documented in the README,
- *      unless you set ENABLED_TOOLS / DISABLED_TOOLS yourself.
+ *   4. rewrites the `search_tasks` description, whose "Works 3 ways" phrasing
+ *      reliably walks smaller models into a dead end (see below).
  *
- * Everything else — every other tool, initialize, prompts, notifications — is
- * passed through untouched, so upstream fixes and new tools arrive with a
- * dependency bump instead of a merge.
+ * Why a separate server rather than a flag
+ * ----------------------------------------
+ * Upstream consolidated its nineteen tools into a handful of multi-action ones,
+ * so the read/write line does not fall between tools: `task_comments` both
+ * reads comments and posts them, `task_time_tracking` both reports time and
+ * starts timers, `operate_tags` both lists tags and creates them. A tool
+ * allowlist therefore cannot express "reads only" — the unit that has to be
+ * filtered is the (tool, action) pair. That filtering has to happen somewhere
+ * the caller cannot reach, which is this proxy.
+ *
+ * Three independent layers hold the line, so no single mistake opens a write:
+ *
+ *   1. the child is started with ENABLED_TOOLS pinned to the read-capable
+ *      tools only, so the write tools are never registered at all. A
+ *      user-supplied ENABLED_TOOLS can narrow that set but never widen it;
+ *   2. every `tools/call` is checked here before it reaches the child, against
+ *      both the tool allowlist and the per-tool action allowlist, so a client
+ *      that calls a tool it was never offered still gets refused;
+ *   3. `tools/list` is filtered on the way back — write tools are dropped, and
+ *      the surviving multi-action tools have their `action` enums pruned and
+ *      their write-only parameters stripped, so an agent is never shown a
+ *      capability it would then be denied.
+ *
+ * The two native tools added here reach ClickUp through one helper that
+ * hardcodes GET and takes a path, not a method, so they cannot become writes
+ * either.
+ *
+ * What this server can NOT do: create, update, delete, move or duplicate a
+ * task; create or delete a list or folder; post a comment; start, stop, add or
+ * delete a time entry; create, rename or delete a tag, or add one to a task;
+ * upload an attachment; create or edit a document.
  *
  * Why get_task_tree exists
  * ------------------------
@@ -57,6 +85,10 @@
  * comments, and renders one chronological log. The endpoint is undocumented, so
  * a failure there is not fatal: the tool degrades to comments plus a note.
  *
+ * A read-only server is not a substitute for a read-only token. ClickUp issues
+ * one personal token with full account rights, so anything else holding that
+ * token can still write; this bounds what THIS server will do with it.
+ *
  * MIT licensed, like the upstream server it wraps.
  */
 
@@ -69,17 +101,19 @@ const VERSION = '1.0.0';
 
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   process.stderr.write(
-    `clickup-mcp-full ${VERSION}\n\n` +
-      'An MCP server. Agents launch it over stdio; there is nothing to run by hand.\n\n' +
+    `clickup-mcp-read ${VERSION}\n\n` +
+      'A READ-ONLY ClickUp MCP server. Agents launch it over stdio; there is\n' +
+      'nothing to run by hand. It cannot create, update or delete anything.\n\n' +
       'Required environment:\n' +
       '  CLICKUP_API_KEY   ClickUp personal API token (Settings -> Apps -> API Token)\n' +
       '  CLICKUP_TEAM_ID   Workspace id (the number in your ClickUp URL)\n\n' +
       'Optional:\n' +
-      '  ENABLED_TOOLS     comma-separated allowlist (overrides the default set)\n' +
+      '  ENABLED_TOOLS     comma-separated allowlist; may only NARROW the\n' +
+      '                    read-only set, never add a write tool back\n' +
       '  DISABLED_TOOLS    comma-separated blocklist\n' +
       '  REQUEST_SPACING   ms between ClickUp API calls (default 100)\n' +
-      '  DOCUMENT_SUPPORT  "true" to expose the document tools\n\n' +
-      'See https://github.com/breckenreed/clickup-mcp-full\n',
+      '  DOCUMENT_SUPPORT  "true" to expose the read-only document tools\n\n' +
+      'See https://github.com/breckenreed/clickup-mcp-read\n',
   );
   process.exit(0);
 }
@@ -89,25 +123,94 @@ if (process.argv.includes('--version') || process.argv.includes('-v')) {
   process.exit(0);
 }
 
-const log = (...parts) => console.error('[clickup-mcp-full]', ...parts);
+const log = (...parts) => console.error('[clickup-mcp-read]', ...parts);
 
 // ── Configuration ──────────────────────────────────────────────────────────
 
-// The nine tools this server exposes by default. Deliberately excludes
-// upstream's tenth, attach_file_to_task: it uploads a local file into ClickUp,
-// which turns any prompt injection an agent reads into a data-egress path.
-// Set ENABLED_TOOLS yourself to include it.
-const DEFAULT_TOOLS = [
-  'get_workspace_hierarchy', // read:  spaces -> folders -> lists
-  'search_tasks',            // read:  by id, by list, or workspace-wide filters
-  'manage_task',             // write: create / update / delete / move / duplicate
-  'task_comments',           // read+write: get / add comments
-  'get_container',           // read:  details of one list or folder
-  'manage_container',        // write: create / update / delete lists and folders
-  'find_members',            // read:  resolve a name or email to an assignee id
-  'operate_tags',            // read+write: list / create / update / delete tags
-  'task_time_tracking',      // read+write: get / start / stop / add / delete entries
-];
+// The read-only policy. A tool absent from this map is refused outright; a
+// tool present with `actions: null` has no write mode to guard; a tool present
+// with a set of actions is reachable only for those.
+//
+// Upstream tools deliberately left out entirely, because every action they
+// offer is a write: manage_task (create/update/delete/move/duplicate),
+// manage_container (create/update/delete lists and folders),
+// attach_file_to_task (uploads a local file into ClickUp) and manage_document
+// (create/update).
+const READ_ONLY_TOOLS = new Map([
+  // No write mode at all.
+  ['get_workspace_hierarchy', { actions: null }], // spaces -> folders -> lists
+  ['search_tasks',            { actions: null }], // by id, by list, or filters
+  ['get_container',           { actions: null }], // details of one list or folder
+  ['find_members',            { actions: null }], // name or email -> assignee id
+  // Multi-action tools, pinned to their reading actions. The rejected ones are
+  // task_comments/create, every timer and entry mutation, and every tag
+  // create/update/delete/add/remove.
+  ['task_comments',      { actions: new Set(['get']) }],
+  ['task_time_tracking', { actions: new Set(['get_entries', 'get_current']) }],
+  ['operate_tags',       { actions: new Set(['list']) }],
+]);
+
+// Upstream registers the document tools only when DOCUMENT_SUPPORT is on, so
+// match that: list_documents reads, and manage_document_page — despite the
+// name — has get and list actions worth keeping. Its create/update are not.
+if (String(process.env.DOCUMENT_SUPPORT).trim() === 'true') {
+  READ_ONLY_TOOLS.set('list_documents', { actions: null });
+  READ_ONLY_TOOLS.set('manage_document_page', { actions: new Set(['get', 'list']) });
+}
+
+// Write-only parameters on the surviving multi-action tools. Left in the
+// schema they are an invitation an agent will accept and then be refused for,
+// so they are stripped from tools/list along with the write actions.
+const WRITE_ONLY_PARAMS = {
+  task_comments: ['commentText', 'notifyAll', 'assignee'],
+  task_time_tracking: [
+    'description', 'billable', 'tags', 'start', 'duration', 'timeEntryId',
+  ],
+  // Everything below the first four belongs to the task scope, which only has
+  // add and remove — both writes. Listing a space's tags needs neither a task
+  // nor a tag name.
+  operate_tags: [
+    'newTagName', 'tagBg', 'tagFg', 'colorCommand',
+    'taskId', 'customTaskId', 'taskName', 'listName', 'tagName',
+  ],
+};
+
+// Non-action enums that the policy also narrows. With add and remove gone,
+// scope "task" has nothing left to do.
+const ENUM_OVERRIDES = {
+  operate_tags: { scope: ['space'] },
+};
+
+const parseToolList = (value) =>
+  String(value || '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean);
+
+// ENABLED_TOOLS may narrow the read-only set; it may not put a write tool back,
+// which is the whole point of this build. DISABLED_TOOLS only ever subtracts.
+let allowedTools = [...READ_ONLY_TOOLS.keys()];
+
+const requested = parseToolList(process.env.ENABLED_TOOLS);
+if (requested.length) {
+  const refused = requested.filter((name) => !READ_ONLY_TOOLS.has(name));
+  if (refused.length) {
+    log(
+      `ignoring write-capable ENABLED_TOOLS entries: ${refused.join(', ')}. ` +
+        'This server is read-only; use clickup-mcp-full if you need writes.',
+    );
+  }
+  allowedTools = allowedTools.filter((name) => requested.includes(name));
+}
+
+const denied = parseToolList(process.env.DISABLED_TOOLS);
+if (denied.length) {
+  allowedTools = allowedTools.filter((name) => !denied.includes(name));
+}
+
+const ALLOWED_TOOLS = new Map(
+  allowedTools.map((name) => [name, READ_ONLY_TOOLS.get(name)]),
+);
 
 const missing = ['CLICKUP_API_KEY', 'CLICKUP_TEAM_ID'].filter(
   (key) => !String(process.env[key] || '').trim(),
@@ -128,16 +231,21 @@ try {
 } catch {
   log(
     'could not resolve @twofeetup/clickup-mcp. Reinstall this package so its ' +
-      'dependency is present (npx -y github:breckenreed/clickup-mcp-full).',
+      'dependency is present (npx -y github:breckenreed/clickup-mcp-read).',
   );
   process.exit(1);
 }
 
-// Respect an explicit tool selection; otherwise pin the documented default set.
+// Layer 1: the child only ever registers the tools that survived the policy,
+// so the write handlers are unreachable even if this proxy were bypassed.
+// An empty ENABLED_TOOLS means "no filter" to upstream — i.e. every tool,
+// writes included — so an empty result has to be spelled as a name that
+// matches nothing rather than as an empty string.
 const childEnv = { ...process.env };
-if (!childEnv.ENABLED_TOOLS && !childEnv.DISABLED_TOOLS) {
-  childEnv.ENABLED_TOOLS = DEFAULT_TOOLS.join(',');
-}
+childEnv.ENABLED_TOOLS = allowedTools.length
+  ? allowedTools.join(',')
+  : '__clickup_mcp_read_none__';
+delete childEnv.DISABLED_TOOLS; // already folded into ENABLED_TOOLS above
 // stdio only: an inherited ENABLE_SSE must not open a listening socket.
 childEnv.ENABLE_SSE = 'false';
 childEnv.ENABLE_STDIO = 'true';
@@ -259,15 +367,41 @@ const DESCRIPTION_OVERRIDES = {
     'which returns the whole nested tree in one compact call.',
 };
 
-// Appended, not replaced: the upstream text still carries the write-side rules
-// for these tools, and only the routing hint is missing.
-const DESCRIPTION_SUFFIXES = {
+// Replaced outright for the multi-action tools: upstream's text is a tour of
+// actions that are not reachable here, and an agent that reads "create (add
+// new comment)" will try it. Each of these describes only what survives.
+Object.assign(DESCRIPTION_OVERRIDES, {
   task_comments:
-    '\n\nREADING NOTE: this returns comments ONLY. For the history of a task — ' +
-    'status changes, due-date moves, assignees, tags, priority, custom ' +
-    'fields — call get_task_activity, which returns those events and the ' +
-    'comments together.',
-};
+    'Read the comments on a task (READ-ONLY). The only action is "get" — this ' +
+    'server cannot post comments. Identify the task with taskId (preferred, ' +
+    'handles regular AND custom ids), or taskName plus listName. Use start / ' +
+    'startId to page.\n' +
+    'This returns comments ONLY. For the history of a task — status changes, ' +
+    'due-date moves, assignees, tags, priority, custom fields — call ' +
+    'get_task_activity, which returns those events and the comments together.',
+  task_time_tracking:
+    'Read tracked time (READ-ONLY). Two actions: "get_entries" for the entries ' +
+    'on one task (optionally filtered by startDate / endDate, which accept ' +
+    'natural language like "last week"), and "get_current" for the timer ' +
+    'running right now. This server cannot start or stop timers, or add or ' +
+    'delete entries.',
+  operate_tags:
+    'List the tags defined in a space (READ-ONLY). The only action is "list", ' +
+    'with scope "space" and a spaceId or spaceName. This server cannot create, ' +
+    'rename or delete tags, or add them to and remove them from tasks. To find ' +
+    'the tasks carrying a tag, use search_tasks with its tags filter.',
+  list_documents:
+    'List and discover ClickUp documents (READ-ONLY). Filter by parent_id plus ' +
+    'parent_type (SPACE, FOLDER, LIST, TASK, WORKSPACE), by creator, or by id; ' +
+    'page with limit and next_cursor. Detail levels: minimal, standard, ' +
+    'detailed.',
+  manage_document_page:
+    'Read the pages of a ClickUp document (READ-ONLY, despite the name). Two ' +
+    'actions: "list" for the page index of a document, and "get" for the ' +
+    'content of one or more pages. This server cannot create or edit pages.',
+});
+
+const DESCRIPTION_SUFFIXES = {};
 
 // ── ClickUp REST (native tools only) ───────────────────────────────────────
 
@@ -757,6 +891,52 @@ function runNativeTool(id, name, args) {
     });
 }
 
+// A refusal is returned as a tool result with isError, not as a JSON-RPC
+// error: an agent reads the text and picks another tool, where a transport
+// error usually just gets retried.
+function refuse(id, text) {
+  if (id === undefined || id === null) return; // a notification has no reply
+  toClient({
+    jsonrpc: '2.0',
+    id,
+    result: { isError: true, content: [{ type: 'text', text }] },
+  });
+}
+
+// Layer 2. Returns null when the call may proceed, or the refusal text.
+function readOnlyRefusal(name, args) {
+  if (NATIVE_TOOL_NAMES.has(name)) return null; // both native tools only read
+
+  const policy = ALLOWED_TOOLS.get(name);
+  if (!policy) {
+    const offered = [...ALLOWED_TOOLS.keys(), ...NATIVE_TOOL_NAMES].join(', ');
+    return (
+      `${name} is not available: this ClickUp server is READ-ONLY and exposes ` +
+      `no tool that creates, updates or deletes anything. Do not retry it, and ` +
+      `do not look for another way to perform the write — report to the user ` +
+      `that it is not possible here. Available tools: ${offered}.`
+    );
+  }
+
+  if (!policy.actions) return null; // nothing to guard on this tool
+
+  const action = String(args?.action ?? '').trim();
+  const allowed = [...policy.actions].map((a) => `"${a}"`).join(' or ');
+  if (!action) {
+    return `${name} requires an action. On this READ-ONLY server the only ` +
+      `accepted value is ${allowed}.`;
+  }
+  if (!policy.actions.has(action)) {
+    return (
+      `${name} action "${action}" is refused: this ClickUp server is READ-ONLY. ` +
+      `Only ${allowed} ${policy.actions.size > 1 ? 'are' : 'is'} accepted. Do ` +
+      `not retry, and do not attempt the change through another tool — report ` +
+      `to the user that writing is not possible here.`
+    );
+  }
+  return null;
+}
+
 function handleFromClient(line) {
   if (!line.trim()) return;
 
@@ -784,12 +964,26 @@ function handleFromClient(line) {
     return;
   }
 
-  // Native tools are answered here and never reach the child.
-  if (msg.method === 'tools/call' && NATIVE_TOOL_NAMES.has(msg.params?.name)) {
-    if (msg.id !== undefined && msg.id !== null) {
-      runNativeTool(msg.id, msg.params.name, msg.params?.arguments || {});
+  if (msg.method === 'tools/call') {
+    const name = msg.params?.name;
+    const args = msg.params?.arguments || {};
+
+    // Every call is checked, including for tools the child would happily run:
+    // a client can name a tool it was never offered in tools/list.
+    const refusal = readOnlyRefusal(name, args);
+    if (refusal) {
+      log(`refused ${name}${args?.action ? ` action=${args.action}` : ''}`);
+      refuse(msg.id, refusal);
+      return;
     }
-    return;
+
+    // Native tools are answered here and never reach the child.
+    if (NATIVE_TOOL_NAMES.has(name)) {
+      if (msg.id !== undefined && msg.id !== null) {
+        runNativeTool(msg.id, name, args);
+      }
+      return;
+    }
   }
 
   if (msg.id !== undefined && msg.id !== null) {
@@ -798,6 +992,49 @@ function handleFromClient(line) {
   }
 
   toChild(msg);
+}
+
+// Prune a tool's advertised schema down to what the policy actually allows:
+// the action enum loses its write values, and the parameters that only exist
+// to carry a write lose their place entirely. An agent should never see an
+// affordance this server will refuse.
+function applyReadOnlySchema(tool) {
+  const policy = ALLOWED_TOOLS.get(tool?.name);
+  const properties = tool?.inputSchema?.properties;
+  if (!policy || !properties) return tool;
+
+  const pruned = { ...properties };
+  let changed = false;
+
+  if (policy.actions && pruned.action) {
+    const kept = Array.isArray(pruned.action.enum)
+      ? pruned.action.enum.filter((value) => policy.actions.has(value))
+      : [...policy.actions];
+    pruned.action = {
+      ...pruned.action,
+      enum: kept.length ? kept : [...policy.actions],
+      description: `REQUIRED. Read-only server: ${
+        [...policy.actions].map((a) => `"${a}"`).join(' or ')
+      } only.`,
+    };
+    changed = true;
+  }
+
+  for (const [name, values] of Object.entries(ENUM_OVERRIDES[tool?.name] || {})) {
+    if (!pruned[name]) continue;
+    pruned[name] = { ...pruned[name], enum: values };
+    changed = true;
+  }
+
+  for (const name of WRITE_ONLY_PARAMS[tool?.name] || []) {
+    if (name in pruned) {
+      delete pruned[name];
+      changed = true;
+    }
+  }
+
+  if (!changed) return tool;
+  return { ...tool, inputSchema: { ...tool.inputSchema, properties: pruned } };
 }
 
 function handleFromChild(line) {
@@ -815,18 +1052,23 @@ function handleFromChild(line) {
 
   if (key !== null && pendingListTools.delete(key)) {
     if (Array.isArray(msg.result?.tools)) {
-      msg.result.tools = msg.result.tools.map((tool) => {
-        const override = DESCRIPTION_OVERRIDES[tool?.name];
-        const suffix = DESCRIPTION_SUFFIXES[tool?.name];
-        if (!override && !suffix) return tool;
-        const base = override ?? tool.description ?? '';
-        return { ...tool, description: suffix ? `${base}${suffix}` : base };
-      });
+      msg.result.tools = msg.result.tools
+        // Layer 3. The child should already be filtered, but a tool it offers
+        // that the policy does not cover is dropped rather than trusted.
+        .filter((tool) => ALLOWED_TOOLS.has(tool?.name))
+        .map(applyReadOnlySchema)
+        .map((tool) => {
+          const override = DESCRIPTION_OVERRIDES[tool?.name];
+          const suffix = DESCRIPTION_SUFFIXES[tool?.name];
+          if (!override && !suffix) return tool;
+          const base = override ?? tool.description ?? '';
+          return { ...tool, description: suffix ? `${base}${suffix}` : base };
+        });
       msg.result.tools.push(...NATIVE_TOOLS);
     }
   } else if (key !== null && pendingInitialize.delete(key)) {
     if (msg.result?.serverInfo?.name) {
-      msg.result.serverInfo.name = 'clickup-mcp-full';
+      msg.result.serverInfo.name = 'clickup-mcp-read';
       msg.result.serverInfo.version = VERSION;
     }
   }
