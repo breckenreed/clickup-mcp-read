@@ -225,6 +225,19 @@ from their parent, those will not appear, and the server falls back to the
 direct children reported by the task endpoint. Open an issue if you hit this
 and it matters.
 
+**Argument spellings are forgiving.** `get_task_tree` and `get_task_activity`
+accept `task_id`, `taskid`, a bare `id` or `task` wherever the schema says
+`taskId`, and the same folding applies to every other argument (`maxDepth` for
+`max_depth`, `includeComments` for `include_comments`). Values are coerced to
+the declared type, so `"true"`, `"15"` and `"status,due_date"` work where a
+boolean, a number and an array are expected. Smaller models get these wrong
+constantly, and the failures were silent rather than loud: an unread `taskId`
+surfaced as "taskId is required", and `include_comments: "false"` is a non-empty
+string, so it read as true. The alias used is logged to stderr. This leniency
+covers those two tools only — the read-only policy gate is not folded or
+coerced, so a mis-spelled `action` on a proxied tool is still refused rather
+than guessed at.
+
 **The activity endpoint is undocumented.** `GET /v1/task/{id}/history` is what
 the ClickUp web app calls, not part of the published v2 API: a personal token
 can read it today, but ClickUp does not promise that, and some plans or tokens
