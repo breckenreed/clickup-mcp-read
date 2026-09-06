@@ -873,8 +873,75 @@ const idKey = (id) => `${typeof id}:${id}`;
 const pendingListTools = new Set();
 const pendingInitialize = new Set();
 
+// ── Argument normalisation ─────────────────────────────────────────────────
+//
+// Smaller models spell an argument the way the surrounding prose reads, not the
+// way the schema declares it: task_id for taskId, "true" for true, a
+// comma-separated string for an array. Every one of those currently fails
+// silently — an unread taskId becomes "taskId is required", and include_comments
+// "false" is a non-empty string, so it reads as true. None of that is worth a
+// retry loop, so accept the spellings and coerce to the declared type. The map
+// is derived from each tool's own inputSchema, so a new argument is covered the
+// moment it is declared.
+
+const foldKey = (key) => String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+
+// Spellings that do not fold to the canonical name on their own.
+const ARG_SYNONYMS = { id: 'taskId', task: 'taskId' };
+
+const NATIVE_ARG_SPECS = new Map(
+  NATIVE_TOOLS.map((tool) => {
+    const props = tool.inputSchema?.properties || {};
+    const byFold = new Map(
+      Object.keys(props).map((name) => [foldKey(name), name]),
+    );
+    return [tool.name, { byFold, props }];
+  }),
+);
+
+function coerceArg(value, type) {
+  if (value === null || value === undefined) return value;
+  if (type === 'number' && typeof value === 'string' && value.trim()) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : value;
+  }
+  if (type === 'boolean' && typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (v === 'true' || v === 'yes' || v === '1') return true;
+    if (v === 'false' || v === 'no' || v === '0') return false;
+  }
+  if (type === 'array' && typeof value === 'string') {
+    return value.split(',').map((part) => part.trim()).filter(Boolean);
+  }
+  if (type === 'array' && !Array.isArray(value)) return [value];
+  return value;
+}
+
+function normaliseArgs(name, args) {
+  const spec = NATIVE_ARG_SPECS.get(name);
+  if (!spec || !args || typeof args !== 'object') return args || {};
+
+  const out = {};
+  const renamed = [];
+  for (const [key, value] of Object.entries(args)) {
+    const fold = foldKey(key);
+    const canonical = spec.byFold.get(fold) || ARG_SYNONYMS[fold];
+    if (!canonical) {
+      out[key] = value; // unknown key: hand it over untouched
+      continue;
+    }
+    // Both spellings can arrive at once; the one carrying a value wins.
+    const held = out[canonical];
+    if (held !== undefined && held !== null && held !== '') continue;
+    if (canonical !== key) renamed.push(`${key}->${canonical}`);
+    out[canonical] = coerceArg(value, spec.props[canonical]?.type);
+  }
+  if (renamed.length) log(`${name}: accepted ${renamed.join(', ')}`);
+  return out;
+}
+
 function runNativeTool(id, name, args) {
-  NATIVE_HANDLERS[name](args)
+  NATIVE_HANDLERS[name](normaliseArgs(name, args))
     .then((text) => {
       toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
     })
