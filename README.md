@@ -1,5 +1,7 @@
 # clickup-mcp-read
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/breckenreed-clickup-mcp-read-ynm8b8)](https://m8ven.ai/mcp/breckenreed-clickup-mcp-read-ynm8b8)
+
 A **strictly read-only** ClickUp MCP server. It answers questions about a
 workspace — including a whole nested subtask tree, or a task's whole activity
 history, in **one call** — and it cannot change anything.
