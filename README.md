@@ -175,6 +175,35 @@ names and the agent sees two distinct tool sets.
 | `CLICKUP_API_KEY` | ClickUp, Settings, Apps, API Token. Starts with `pk_`. |
 | `CLICKUP_TEAM_ID` | The number in your ClickUp URL, or `curl -H "Authorization: $CLICKUP_API_KEY" https://api.clickup.com/api/v2/team` and read `.teams[].id`. |
 
+### Where the token goes
+
+Refusing to write is only half the problem: the token this server holds is a
+full-workspace credential either way, so it is kept on a short leash. See
+[SECURITY.md](SECURITY.md).
+
+- **One origin.** Every request the native tools make is built as a `URL` and
+  checked against `https://api.clickup.com` before the `Authorization` header
+  is attached. A request to any other origin throws instead of being sent.
+- **Read-only native path.** `get_task_tree` and `get_task_activity` share a
+  single helper with the method hardcoded to `GET`; callers pass a path, never
+  a method or a host.
+- **A trimmed child environment.** The upstream server runs as a child process
+  and receives only the variables it reads (`CLICKUP_*`, `REQUEST_SPACING`,
+  `LOG_LEVEL`, `DOCUMENT_*`) plus what Node needs to start — not your editor's
+  whole environment, and not `NODE_OPTIONS`. `ENABLED_TOOLS` and
+  `DISABLED_TOOLS` are not passed through either: the child is told the
+  *result* of the read-only policy, so its own filtering cannot disagree with
+  it.
+- **A fixed child.** The spawned server is resolved from the installed
+  `@twofeetup/clickup-mcp`. `CLICKUP_MCP_ENTRY` can only point inside that
+  package, so no environment variable can redirect the credential into other
+  code.
+- **No listening socket.** `ENABLE_SSE` is forced off and `ENABLE_STDIO` on,
+  whatever the environment says, so the server is reachable only over the stdio
+  pipe of the process that launched it.
+- **No file uploads.** `attach_file_to_task` is absent, so a prompt injection an
+  agent reads cannot become a data-egress path.
+
 ## Tools
 
 Every tool here is read-only. Nine are exposed by default.
