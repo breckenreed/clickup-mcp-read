@@ -75,6 +75,16 @@ An agent reading task descriptions and comments is reading untrusted text. This
 server bounds what that text can make the agent *do to ClickUp*; it does not
 bound what the agent does with the text elsewhere.
 
+## Verifying this yourself
+
+`npm test` runs the whole suite on the standard library alone — no network, no
+ClickUp workspace. `test/tools.test.mjs` asserts the policy as a pure function:
+every write tool refused by name, every write action refused on the tools that
+survive, and `ENABLED_TOOLS` unable to widen the set. `test/server.test.mjs`
+spawns the server as a host would and asserts the same refusals over the real
+stdio protocol, plus the guard on the entry override, the rejection of JSON-RPC
+batches, and that missing credentials stop the process.
+
 ## Supported versions
 
 Fixes land on `main` and are released from it. There are no maintained release

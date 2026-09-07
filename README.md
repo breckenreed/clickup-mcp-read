@@ -6,6 +6,8 @@ A **strictly read-only** ClickUp MCP server. It answers questions about a
 workspace — including a whole nested subtask tree, or a task's whole activity
 history, in **one call** — and it cannot change anything.
 
+[![M8ven Trust Score](https://m8ven.ai/badge/mcp/breckenreed-clickup-mcp-read-ynm8b8)](https://m8ven.ai/mcp/breckenreed-clickup-mcp-read-ynm8b8)
+
 This is [`clickup-mcp-full`](https://github.com/breckenreed/clickup-mcp-full)
 with every write path removed. Like that server, it wraps
 [`@twofeetup/clickup-mcp`](https://www.npmjs.com/package/@twofeetup/clickup-mcp)
@@ -180,8 +182,8 @@ names and the agent sees two distinct tool sets.
 ### Where the token goes
 
 Refusing to write is only half the problem: the token this server holds is a
-full-workspace credential either way, so it is kept on a short leash. See
-[SECURITY.md](SECURITY.md).
+full-workspace credential either way, so it is kept on a short leash. All of it
+is asserted by the tests in `test/`. See [SECURITY.md](SECURITY.md).
 
 - **One origin.** Every request the native tools make is built as a `URL` and
   checked against `https://api.clickup.com` before the `Authorization` header
@@ -236,6 +238,7 @@ Upstream's `manage_task`, `manage_container`, `attach_file_to_task` and
 | `DISABLED_TOOLS` | unset | Comma-separated blocklist. Only ever subtracts. |
 | `REQUEST_SPACING` | `100` | Milliseconds between ClickUp API calls. See below. |
 | `DOCUMENT_SUPPORT` | `false` | `true` exposes the two read-only document tools. |
+| `CLICKUP_MCP_ENTRY` | unset | Path to the wrapped server, for unusual install layouts. It may only point inside the installed `@twofeetup/clickup-mcp`. |
 
 **Raise `REQUEST_SPACING` on a shared workspace.** The default allows about ten
 requests per second, while ClickUp's per-token limit is roughly 100 per minute
@@ -289,6 +292,30 @@ description with the single rule the model actually needs.
 servers with `HOME` pointing at a bind mount, `npx` rebuilds its package cache
 across that mount on every connect, which can take minutes and time out. Install
 globally inside the image instead and point `command:` at the binary.
+
+**Every tool is annotated read-only.** All eleven declare `readOnlyHint: true`,
+`destructiveHint: false`, `idempotentHint: true` and `openWorldHint: true`, so a
+host can decide what to warn about before it calls anything, and directories
+that require the four hints (OpenAI's among them) accept the set. On this
+server they are all the same claim, because a tool that could make any other
+claim is not exposed at all — that is the annotation this build exists to be
+able to make honestly.
+
+## Development
+
+There is nothing to build. The tests run on the standard library alone:
+
+```bash
+npm test
+```
+
+`test/format.test.mjs` and `test/tools.test.mjs` cover the tree assembly, the
+activity rendering, the argument normalisation, and the read-only policy as
+plain functions — every write tool and every write action, checked by name.
+`test/server.test.mjs` spawns the server the way a host does and drives it over
+stdio: the handshake, the tool list, the pruned schemas, the refusals, the
+guard on the entry override, and the fact that `ENABLED_TOOLS` cannot put a
+write tool back. None of them touch the network or need a ClickUp workspace.
 
 ## Troubleshooting
 

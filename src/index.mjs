@@ -109,6 +109,27 @@ import { createRequire } from 'node:module';
 import { dirname, resolve as resolvePath, sep } from 'node:path';
 import { createInterface } from 'node:readline';
 
+import {
+  actorName,
+  asMillis,
+  clip,
+  commentText,
+  FIELD_LABELS,
+  formatStamp,
+  indexByParent,
+  normaliseHistoryEntry,
+  parseSince,
+  renderTree,
+} from './format.mjs';
+import {
+  decorateChildTools,
+  NATIVE_TOOLS,
+  NATIVE_TOOL_NAMES,
+  normaliseArgs,
+  readOnlyRefusal,
+  resolveAllowedTools,
+} from './tools.mjs';
+
 const require = createRequire(import.meta.url);
 const VERSION = '1.0.0';
 
@@ -149,81 +170,16 @@ const log = (...parts) => console.error('[clickup-mcp-read]', ...parts);
 // manage_container (create/update/delete lists and folders),
 // attach_file_to_task (uploads a local file into ClickUp) and manage_document
 // (create/update).
-const READ_ONLY_TOOLS = new Map([
-  // No write mode at all.
-  ['get_workspace_hierarchy', { actions: null }], // spaces -> folders -> lists
-  ['search_tasks',            { actions: null }], // by id, by list, or filters
-  ['get_container',           { actions: null }], // details of one list or folder
-  ['find_members',            { actions: null }], // name or email -> assignee id
-  // Multi-action tools, pinned to their reading actions. The rejected ones are
-  // task_comments/create, every timer and entry mutation, and every tag
-  // create/update/delete/add/remove.
-  ['task_comments',      { actions: new Set(['get']) }],
-  ['task_time_tracking', { actions: new Set(['get_entries', 'get_current']) }],
-  ['operate_tags',       { actions: new Set(['list']) }],
-]);
-
-// Upstream registers the document tools only when DOCUMENT_SUPPORT is on, so
-// match that: list_documents reads, and manage_document_page — despite the
-// name — has get and list actions worth keeping. Its create/update are not.
-if (String(process.env.DOCUMENT_SUPPORT).trim() === 'true') {
-  READ_ONLY_TOOLS.set('list_documents', { actions: null });
-  READ_ONLY_TOOLS.set('manage_document_page', { actions: new Set(['get', 'list']) });
+// The policy itself lives in tools.mjs, where it can be tested without
+// spawning anything. Here it is only resolved against the environment.
+const { allowed: ALLOWED_TOOLS, ignored } = resolveAllowedTools(process.env);
+if (ignored.length) {
+  log(
+    `ignoring write-capable ENABLED_TOOLS entries: ${ignored.join(', ')}. ` +
+      'This server is read-only; use clickup-mcp-full if you need writes.',
+  );
 }
-
-// Write-only parameters on the surviving multi-action tools. Left in the
-// schema they are an invitation an agent will accept and then be refused for,
-// so they are stripped from tools/list along with the write actions.
-const WRITE_ONLY_PARAMS = {
-  task_comments: ['commentText', 'notifyAll', 'assignee'],
-  task_time_tracking: [
-    'description', 'billable', 'tags', 'start', 'duration', 'timeEntryId',
-  ],
-  // Everything below the first four belongs to the task scope, which only has
-  // add and remove — both writes. Listing a space's tags needs neither a task
-  // nor a tag name.
-  operate_tags: [
-    'newTagName', 'tagBg', 'tagFg', 'colorCommand',
-    'taskId', 'customTaskId', 'taskName', 'listName', 'tagName',
-  ],
-};
-
-// Non-action enums that the policy also narrows. With add and remove gone,
-// scope "task" has nothing left to do.
-const ENUM_OVERRIDES = {
-  operate_tags: { scope: ['space'] },
-};
-
-const parseToolList = (value) =>
-  String(value || '')
-    .split(',')
-    .map((name) => name.trim())
-    .filter(Boolean);
-
-// ENABLED_TOOLS may narrow the read-only set; it may not put a write tool back,
-// which is the whole point of this build. DISABLED_TOOLS only ever subtracts.
-let allowedTools = [...READ_ONLY_TOOLS.keys()];
-
-const requested = parseToolList(process.env.ENABLED_TOOLS);
-if (requested.length) {
-  const refused = requested.filter((name) => !READ_ONLY_TOOLS.has(name));
-  if (refused.length) {
-    log(
-      `ignoring write-capable ENABLED_TOOLS entries: ${refused.join(', ')}. ` +
-        'This server is read-only; use clickup-mcp-full if you need writes.',
-    );
-  }
-  allowedTools = allowedTools.filter((name) => requested.includes(name));
-}
-
-const denied = parseToolList(process.env.DISABLED_TOOLS);
-if (denied.length) {
-  allowedTools = allowedTools.filter((name) => !denied.includes(name));
-}
-
-const ALLOWED_TOOLS = new Map(
-  allowedTools.map((name) => [name, READ_ONLY_TOOLS.get(name)]),
-);
+const allowedTools = [...ALLOWED_TOOLS.keys()];
 
 const missing = ['CLICKUP_API_KEY', 'CLICKUP_TEAM_ID'].filter(
   (key) => !String(process.env[key] || '').trim(),
@@ -347,149 +303,6 @@ child.on('error', (err) => {
   process.exit(1);
 });
 
-// ── Native tools ───────────────────────────────────────────────────────────
-
-const NATIVE_TOOLS = [
-  {
-    name: 'get_task_tree',
-    description:
-      'Read a task together with ALL its nested subtasks, at every depth, in ' +
-      'ONE call (READ-ONLY). Use this whenever the question involves subtasks, ' +
-      'children, breakdown or progress of a task, and never fetch subtasks one ' +
-      'by one. Returns a compact indented tree (id, status, name, assignees) ' +
-      'plus a status tally, not full task objects.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        taskId: {
-          type: 'string',
-          description:
-            'REQUIRED: id of the root task, e.g. "86capt3b". Works with both ' +
-            'regular and custom ids.',
-        },
-        include_closed: {
-          type: 'boolean',
-          description: 'Include closed/done subtasks (default: true)',
-        },
-        max_depth: {
-          type: 'number',
-          description: 'Maximum nesting depth to walk (default: 10)',
-        },
-      },
-      required: ['taskId'],
-    },
-  },
-  {
-    name: 'get_task_activity',
-    description:
-      'Read the FULL activity log of a task in ONE call (READ-ONLY): every ' +
-      'system event — status changes, due/start date moves, assignees, ' +
-      'watchers, tags, priority, name and description edits, custom fields, ' +
-      'list/folder moves, attachments, checklists, time estimates, task ' +
-      'relationships — merged with the comments into one chronological view ' +
-      'with who did what and when. Use this for any question about the ' +
-      'history of a task ("who changed the deadline", "when did it move to in ' +
-      'progress", "who assigned this", "what happened last week"). ' +
-      'task_comments only returns comments and answers none of those.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        taskId: {
-          type: 'string',
-          description:
-            'REQUIRED: id of the task, e.g. "86capt3b". Works with both ' +
-            'regular and custom ids.',
-        },
-        limit: {
-          type: 'number',
-          description: 'Maximum number of events to return (default: 100)',
-        },
-        include_comments: {
-          type: 'boolean',
-          description:
-            'Include comments alongside the system events (default: true)',
-        },
-        fields: {
-          type: 'array',
-          items: { type: 'string' },
-          description:
-            'Only return these event kinds. Use the raw ClickUp field names: ' +
-            'status, assignee_add, assignee_rem, watcher_add, watcher_rem, ' +
-            'due_date, start_date, priority, tag, name, content, comment, ' +
-            'section_moved, subcategory, attachment, checklist, ' +
-            'checklist_item, time_estimate, time_spent, custom_field, ' +
-            'task_creation, linked_task, dependency. Omit for everything.',
-        },
-        since: {
-          type: 'string',
-          description:
-            'Only events at or after this point. ISO date ("2026-01-31") or a ' +
-            'millisecond timestamp.',
-        },
-        oldest_first: {
-          type: 'boolean',
-          description:
-            'Render oldest event first instead of newest first (default: false)',
-        },
-      },
-      required: ['taskId'],
-    },
-  },
-];
-
-const NATIVE_TOOL_NAMES = new Set(NATIVE_TOOLS.map((t) => t.name));
-
-const DESCRIPTION_OVERRIDES = {
-  search_tasks:
-    'Find tasks. Pick ONE of three modes:\n' +
-    '(1) ONE known task: pass taskId. A plain id like "86capt3b" is a taskId — ' +
-    'it handles regular AND custom ids, so use it by default. Only use ' +
-    'customTaskId for ids with a project prefix like "DEV-123". Putting a ' +
-    'plain id in customTaskId fails with a misleading "filter required" error.\n' +
-    '(2) One list: pass listId or listName.\n' +
-    '(3) Across the workspace: pass at least one real filter (tags, statuses, ' +
-    'assignees, list_ids, folder_ids, space_ids, or a date filter). A task id ' +
-    'is NOT a filter.\n' +
-    'For the subtasks of a task do NOT use this tool — call get_task_tree, ' +
-    'which returns the whole nested tree in one compact call.',
-};
-
-// Replaced outright for the multi-action tools: upstream's text is a tour of
-// actions that are not reachable here, and an agent that reads "create (add
-// new comment)" will try it. Each of these describes only what survives.
-Object.assign(DESCRIPTION_OVERRIDES, {
-  task_comments:
-    'Read the comments on a task (READ-ONLY). The only action is "get" — this ' +
-    'server cannot post comments. Identify the task with taskId (preferred, ' +
-    'handles regular AND custom ids), or taskName plus listName. Use start / ' +
-    'startId to page.\n' +
-    'This returns comments ONLY. For the history of a task — status changes, ' +
-    'due-date moves, assignees, tags, priority, custom fields — call ' +
-    'get_task_activity, which returns those events and the comments together.',
-  task_time_tracking:
-    'Read tracked time (READ-ONLY). Two actions: "get_entries" for the entries ' +
-    'on one task (optionally filtered by startDate / endDate, which accept ' +
-    'natural language like "last week"), and "get_current" for the timer ' +
-    'running right now. This server cannot start or stop timers, or add or ' +
-    'delete entries.',
-  operate_tags:
-    'List the tags defined in a space (READ-ONLY). The only action is "list", ' +
-    'with scope "space" and a spaceId or spaceName. This server cannot create, ' +
-    'rename or delete tags, or add them to and remove them from tasks. To find ' +
-    'the tasks carrying a tag, use search_tasks with its tags filter.',
-  list_documents:
-    'List and discover ClickUp documents (READ-ONLY). Filter by parent_id plus ' +
-    'parent_type (SPACE, FOLDER, LIST, TASK, WORKSPACE), by creator, or by id; ' +
-    'page with limit and next_cursor. Detail levels: minimal, standard, ' +
-    'detailed.',
-  manage_document_page:
-    'Read the pages of a ClickUp document (READ-ONLY, despite the name). Two ' +
-    'actions: "list" for the page index of a document, and "get" for the ' +
-    'content of one or more pages. This server cannot create or edit pages.',
-});
-
-const DESCRIPTION_SUFFIXES = {};
-
 // ── ClickUp REST (native tools only) ───────────────────────────────────────
 
 const CLICKUP_ORIGIN = 'https://api.clickup.com';
@@ -546,47 +359,6 @@ async function fetchListTasks(listId, includeClosed) {
   return collected;
 }
 
-function renderTree(root, childrenBy, maxDepth) {
-  const lines = [];
-  const tally = new Map();
-  const seen = new Set();
-  let count = 0;
-
-  const walk = (task, depth) => {
-    if (seen.has(task.id)) return; // a cycle would otherwise recurse forever
-    seen.add(task.id);
-
-    const status = task.status?.status || 'no status';
-    tally.set(status, (tally.get(status) || 0) + 1);
-    count++;
-
-    const who = (task.assignees || [])
-      .map((a) => a.username || a.email)
-      .filter(Boolean)
-      .join(', ');
-    const custom = task.custom_id ? ` (${task.custom_id})` : '';
-    lines.push(
-      `${'  '.repeat(depth)}${task.id}${custom}  [${status}]  ${task.name}` +
-        (who ? `  <${who}>` : ''),
-    );
-
-    const children = childrenBy.get(task.id) || [];
-    if (depth >= maxDepth) {
-      if (children.length) {
-        lines.push(
-          `${'  '.repeat(depth + 1)}... ${children.length} more, depth limit reached`,
-        );
-      }
-      return;
-    }
-    for (const child of children) walk(child, depth + 1);
-  };
-
-  walk(root, 0);
-  const summary = [...tally.entries()].map(([s, n]) => `${s}: ${n}`).join(', ');
-  return { text: lines.join('\n'), count, summary };
-}
-
 async function getTaskTree(args) {
   const taskId = String(args?.taskId || '').trim();
   if (!taskId) throw new Error('taskId is required');
@@ -611,14 +383,11 @@ async function getTaskTree(args) {
   }
   if (pool.length === 0) pool = [root, ...(root.subtasks || [])];
 
-  const childrenBy = new Map();
-  for (const task of pool) {
-    if (!task.parent) continue;
-    if (!childrenBy.has(task.parent)) childrenBy.set(task.parent, []);
-    childrenBy.get(task.parent).push(task);
-  }
-
-  const { text, count, summary } = renderTree(root, childrenBy, maxDepth);
+  const { text, count, summary } = renderTree(
+    root,
+    indexByParent(pool),
+    maxDepth,
+  );
   const header =
     `Task tree for ${root.id}${root.custom_id ? ` (${root.custom_id})` : ''}: ` +
     `${count} task(s) including the root.\n` +
@@ -632,231 +401,6 @@ async function getTaskTree(args) {
 // ClickUp names history entries by the field they touched. Anything not listed
 // is rendered under its raw name rather than dropped, so a field added upstream
 // still shows up.
-const FIELD_LABELS = {
-  status: 'Status',
-  assignee_add: 'Assignee added',
-  assignee_rem: 'Assignee removed',
-  watcher_add: 'Watcher added',
-  watcher_rem: 'Watcher removed',
-  due_date: 'Due date',
-  start_date: 'Start date',
-  date_closed: 'Closed',
-  date_done: 'Done',
-  priority: 'Priority',
-  tag: 'Tags',
-  name: 'Name',
-  content: 'Description',
-  comment: 'Comment',
-  section_moved: 'Moved to list',
-  subcategory: 'Moved',
-  attachment: 'Attachment',
-  checklist: 'Checklist',
-  checklist_item: 'Checklist item',
-  time_estimate: 'Time estimate',
-  time_spent: 'Time tracked',
-  custom_field: 'Custom field',
-  task_creation: 'Created',
-  linked_task: 'Linked task',
-  dependency: 'Dependency',
-  relationship: 'Relationship',
-  points: 'Sprint points',
-  archived: 'Archived',
-  group_assignee_add: 'Team assigned',
-  group_assignee_rem: 'Team unassigned',
-};
-
-const DATE_FIELDS = new Set([
-  'due_date',
-  'start_date',
-  'date_closed',
-  'date_done',
-]);
-const DURATION_FIELDS = new Set(['time_estimate', 'time_spent']);
-
-const asMillis = (value) => {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? n : null;
-};
-
-function formatStamp(value) {
-  const ms = asMillis(value);
-  if (ms === null) return String(value ?? '');
-  return new Date(ms).toISOString().replace('T', ' ').slice(0, 16);
-}
-
-function formatDuration(value) {
-  const ms = asMillis(value);
-  if (ms === null) return String(value ?? '');
-  const minutes = Math.round(ms / 60000);
-  const h = Math.floor(minutes / 60);
-  const m = minutes % 60;
-  return h ? `${h}h${m ? ` ${m}m` : ''}` : `${m}m`;
-}
-
-const clip = (text, max) => {
-  const flat = String(text).replace(/\s+/g, ' ').trim();
-  return flat.length > max ? `${flat.slice(0, max)}…` : flat;
-};
-
-// History values are wildly polymorphic: a scalar, a status/priority/user
-// object, or an array of tags. Reduce whatever arrives to one readable token.
-function valueLabel(field, value) {
-  if (value === null || value === undefined || value === '') return 'none';
-  if (Array.isArray(value)) {
-    if (value.length === 0) return 'none';
-    return value.map((item) => valueLabel(field, item)).join(', ');
-  }
-  if (typeof value === 'object') {
-    const picked =
-      value.status ??
-      value.priority ??
-      value.username ??
-      value.email ??
-      value.name ??
-      value.title ??
-      value.tag_name ??
-      value.value ??
-      value.text_content ??
-      value.date;
-    if (picked !== undefined && picked !== null && typeof picked !== 'object') {
-      return valueLabel(field, picked);
-    }
-    return clip(JSON.stringify(value), 120);
-  }
-  if (DATE_FIELDS.has(field)) return formatStamp(value);
-  if (DURATION_FIELDS.has(field)) return formatDuration(value);
-  return clip(value, field === 'content' ? 120 : 160);
-}
-
-function commentText(comment) {
-  if (!comment) return '';
-  if (typeof comment === 'string') return comment;
-  if (comment.comment_text) return comment.comment_text;
-  if (Array.isArray(comment.comment)) {
-    return comment.comment.map((part) => part?.text || '').join('');
-  }
-  if (typeof comment.comment === 'string') return comment.comment;
-  return '';
-}
-
-const actorName = (user) =>
-  user?.username || user?.email || (user?.id ? `user ${user.id}` : 'unknown');
-
-// One history entry -> one normalised event. Comments arrive both as history
-// entries and from the comment endpoint, so each carries its comment id for
-// de-duplication.
-function normaliseHistoryEntry(entry) {
-  const field = entry?.field || 'unknown';
-  const date = asMillis(entry?.date) ?? 0;
-  const base = {
-    date,
-    field,
-    who: actorName(entry?.user),
-    commentId: entry?.comment?.id ? String(entry.comment.id) : null,
-  };
-
-  if (field === 'comment') {
-    const text = commentText(entry.comment);
-    return { ...base, detail: text ? clip(text, 400) : '(empty comment)' };
-  }
-
-  const label =
-    field === 'custom_field' && entry?.custom_field?.name
-      ? `${FIELD_LABELS.custom_field} "${entry.custom_field.name}"`
-      : FIELD_LABELS[field] || field;
-
-  const before = valueLabel(field, entry?.before);
-  const after = valueLabel(field, entry?.after);
-
-  // Additive events (a tag, an assignee, an attachment) only carry `after`;
-  // rendering "none -> x" for those is noise.
-  let detail;
-  if (before === 'none' && after === 'none') detail = label;
-  else if (before === 'none') detail = `${label}: ${after}`;
-  else if (after === 'none') detail = `${label}: ${before} → (cleared)`;
-  else if (before === after) detail = `${label}: ${after}`;
-  else detail = `${label}: ${before} → ${after}`;
-
-  return { ...base, detail };
-}
-
-// The history endpoint pages backwards from `start`/`start_id`, the same way
-// the web app scrolls it. Ten pages is roughly a thousand events.
-async function fetchHistory(taskId, limit) {
-  const collected = [];
-  const seen = new Set();
-  let cursor = null;
-
-  for (let page = 0; page < 10; page++) {
-    if (page > 0) await spaceRequests();
-    const query = cursor
-      ? `?start=${encodeURIComponent(cursor.date)}&start_id=${encodeURIComponent(cursor.id)}`
-      : '';
-    const data = await clickupGet(
-      `/task/${encodeURIComponent(taskId)}/history${query}`,
-      CLICKUP_V1,
-    );
-    const entries = Array.isArray(data?.history) ? data.history : [];
-    let added = 0;
-    for (const entry of entries) {
-      const id = String(entry?.id ?? '');
-      if (id && seen.has(id)) continue;
-      if (id) seen.add(id);
-      collected.push(entry);
-      added++;
-    }
-    const last = entries[entries.length - 1];
-    if (!added || !last?.id || !last?.date) break;
-    if (collected.length >= limit * 3) break; // room to spare for filtering
-    cursor = { date: last.date, id: last.id };
-  }
-  return collected;
-}
-
-async function fetchComments(taskId, limit) {
-  const collected = [];
-  const seen = new Set();
-  let cursor = null;
-
-  for (let page = 0; page < 10; page++) {
-    if (page > 0) await spaceRequests();
-    const query = cursor
-      ? `?start=${encodeURIComponent(cursor.date)}&start_id=${encodeURIComponent(cursor.id)}`
-      : '';
-    const data = await clickupGet(
-      `/task/${encodeURIComponent(taskId)}/comment${query}`,
-    );
-    const comments = Array.isArray(data?.comments) ? data.comments : [];
-    let added = 0;
-    for (const comment of comments) {
-      const id = String(comment?.id ?? '');
-      if (id && seen.has(id)) continue;
-      if (id) seen.add(id);
-      collected.push(comment);
-      added++;
-    }
-    const last = comments[comments.length - 1];
-    if (!added || !last?.id || !last?.date) break;
-    if (collected.length >= limit * 3) break;
-    cursor = { date: last.date, id: last.id };
-  }
-  return collected;
-}
-
-function parseSince(since) {
-  if (since === undefined || since === null || since === '') return null;
-  const ms = asMillis(since);
-  if (ms !== null) return ms;
-  const parsed = Date.parse(String(since));
-  if (Number.isNaN(parsed)) {
-    throw new Error(
-      `could not read "since" as a date: pass an ISO date like "2026-01-31" ` +
-        'or a millisecond timestamp',
-    );
-  }
-  return parsed;
-}
-
 async function getTaskActivity(args) {
   const taskId = String(args?.taskId || '').trim();
   if (!taskId) throw new Error('taskId is required');
@@ -968,75 +512,11 @@ const idKey = (id) => `${typeof id}:${id}`;
 const pendingListTools = new Set();
 const pendingInitialize = new Set();
 
-// ── Argument normalisation ─────────────────────────────────────────────────
-//
-// Smaller models spell an argument the way the surrounding prose reads, not the
-// way the schema declares it: task_id for taskId, "true" for true, a
-// comma-separated string for an array. Every one of those currently fails
-// silently — an unread taskId becomes "taskId is required", and include_comments
-// "false" is a non-empty string, so it reads as true. None of that is worth a
-// retry loop, so accept the spellings and coerce to the declared type. The map
-// is derived from each tool's own inputSchema, so a new argument is covered the
-// moment it is declared.
-
-const foldKey = (key) => String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
-
-// Spellings that do not fold to the canonical name on their own.
-const ARG_SYNONYMS = { id: 'taskId', task: 'taskId' };
-
-const NATIVE_ARG_SPECS = new Map(
-  NATIVE_TOOLS.map((tool) => {
-    const props = tool.inputSchema?.properties || {};
-    const byFold = new Map(
-      Object.keys(props).map((name) => [foldKey(name), name]),
-    );
-    return [tool.name, { byFold, props }];
-  }),
-);
-
-function coerceArg(value, type) {
-  if (value === null || value === undefined) return value;
-  if (type === 'number' && typeof value === 'string' && value.trim()) {
-    const n = Number(value);
-    return Number.isFinite(n) ? n : value;
-  }
-  if (type === 'boolean' && typeof value === 'string') {
-    const v = value.trim().toLowerCase();
-    if (v === 'true' || v === 'yes' || v === '1') return true;
-    if (v === 'false' || v === 'no' || v === '0') return false;
-  }
-  if (type === 'array' && typeof value === 'string') {
-    return value.split(',').map((part) => part.trim()).filter(Boolean);
-  }
-  if (type === 'array' && !Array.isArray(value)) return [value];
-  return value;
-}
-
-function normaliseArgs(name, args) {
-  const spec = NATIVE_ARG_SPECS.get(name);
-  if (!spec || !args || typeof args !== 'object') return args || {};
-
-  const out = {};
-  const renamed = [];
-  for (const [key, value] of Object.entries(args)) {
-    const fold = foldKey(key);
-    const canonical = spec.byFold.get(fold) || ARG_SYNONYMS[fold];
-    if (!canonical) {
-      out[key] = value; // unknown key: hand it over untouched
-      continue;
-    }
-    // Both spellings can arrive at once; the one carrying a value wins.
-    const held = out[canonical];
-    if (held !== undefined && held !== null && held !== '') continue;
-    if (canonical !== key) renamed.push(`${key}->${canonical}`);
-    out[canonical] = coerceArg(value, spec.props[canonical]?.type);
-  }
+function runNativeTool(id, name, rawArgs) {
+  const { args, renamed } = normaliseArgs(name, rawArgs);
   if (renamed.length) log(`${name}: accepted ${renamed.join(', ')}`);
-  return out;
-}
 
-function runNativeTool(id, name, args) {
-  NATIVE_HANDLERS[name](normaliseArgs(name, args))
+  NATIVE_HANDLERS[name](args)
     .then((text) => {
       toClient({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text }] } });
     })
@@ -1066,39 +546,6 @@ function refuse(id, text) {
 }
 
 // Layer 2. Returns null when the call may proceed, or the refusal text.
-function readOnlyRefusal(name, args) {
-  if (NATIVE_TOOL_NAMES.has(name)) return null; // both native tools only read
-
-  const policy = ALLOWED_TOOLS.get(name);
-  if (!policy) {
-    const offered = [...ALLOWED_TOOLS.keys(), ...NATIVE_TOOL_NAMES].join(', ');
-    return (
-      `${name} is not available: this ClickUp server is READ-ONLY and exposes ` +
-      `no tool that creates, updates or deletes anything. Do not retry it, and ` +
-      `do not look for another way to perform the write — report to the user ` +
-      `that it is not possible here. Available tools: ${offered}.`
-    );
-  }
-
-  if (!policy.actions) return null; // nothing to guard on this tool
-
-  const action = String(args?.action ?? '').trim();
-  const allowed = [...policy.actions].map((a) => `"${a}"`).join(' or ');
-  if (!action) {
-    return `${name} requires an action. On this READ-ONLY server the only ` +
-      `accepted value is ${allowed}.`;
-  }
-  if (!policy.actions.has(action)) {
-    return (
-      `${name} action "${action}" is refused: this ClickUp server is READ-ONLY. ` +
-      `Only ${allowed} ${policy.actions.size > 1 ? 'are' : 'is'} accepted. Do ` +
-      `not retry, and do not attempt the change through another tool — report ` +
-      `to the user that writing is not possible here.`
-    );
-  }
-  return null;
-}
-
 function handleFromClient(line) {
   if (!line.trim()) return;
 
@@ -1132,7 +579,7 @@ function handleFromClient(line) {
 
     // Every call is checked, including for tools the child would happily run:
     // a client can name a tool it was never offered in tools/list.
-    const refusal = readOnlyRefusal(name, args);
+    const refusal = readOnlyRefusal(name, args, ALLOWED_TOOLS);
     if (refusal) {
       log(`refused ${name}${args?.action ? ` action=${args.action}` : ''}`);
       refuse(msg.id, refusal);
@@ -1160,45 +607,6 @@ function handleFromClient(line) {
 // the action enum loses its write values, and the parameters that only exist
 // to carry a write lose their place entirely. An agent should never see an
 // affordance this server will refuse.
-function applyReadOnlySchema(tool) {
-  const policy = ALLOWED_TOOLS.get(tool?.name);
-  const properties = tool?.inputSchema?.properties;
-  if (!policy || !properties) return tool;
-
-  const pruned = { ...properties };
-  let changed = false;
-
-  if (policy.actions && pruned.action) {
-    const kept = Array.isArray(pruned.action.enum)
-      ? pruned.action.enum.filter((value) => policy.actions.has(value))
-      : [...policy.actions];
-    pruned.action = {
-      ...pruned.action,
-      enum: kept.length ? kept : [...policy.actions],
-      description: `REQUIRED. Read-only server: ${
-        [...policy.actions].map((a) => `"${a}"`).join(' or ')
-      } only.`,
-    };
-    changed = true;
-  }
-
-  for (const [name, values] of Object.entries(ENUM_OVERRIDES[tool?.name] || {})) {
-    if (!pruned[name]) continue;
-    pruned[name] = { ...pruned[name], enum: values };
-    changed = true;
-  }
-
-  for (const name of WRITE_ONLY_PARAMS[tool?.name] || []) {
-    if (name in pruned) {
-      delete pruned[name];
-      changed = true;
-    }
-  }
-
-  if (!changed) return tool;
-  return { ...tool, inputSchema: { ...tool.inputSchema, properties: pruned } };
-}
-
 function handleFromChild(line) {
   if (!line.trim()) return;
 
@@ -1214,18 +622,9 @@ function handleFromChild(line) {
 
   if (key !== null && pendingListTools.delete(key)) {
     if (Array.isArray(msg.result?.tools)) {
-      msg.result.tools = msg.result.tools
-        // Layer 3. The child should already be filtered, but a tool it offers
-        // that the policy does not cover is dropped rather than trusted.
-        .filter((tool) => ALLOWED_TOOLS.has(tool?.name))
-        .map(applyReadOnlySchema)
-        .map((tool) => {
-          const override = DESCRIPTION_OVERRIDES[tool?.name];
-          const suffix = DESCRIPTION_SUFFIXES[tool?.name];
-          if (!override && !suffix) return tool;
-          const base = override ?? tool.description ?? '';
-          return { ...tool, description: suffix ? `${base}${suffix}` : base };
-        });
+      // Layer 3. The child should already be filtered, but a tool it offers
+      // that the policy does not cover is dropped rather than trusted.
+      msg.result.tools = decorateChildTools(msg.result.tools, ALLOWED_TOOLS);
       msg.result.tools.push(...NATIVE_TOOLS);
     }
   } else if (key !== null && pendingInitialize.delete(key)) {
