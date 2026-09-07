@@ -89,12 +89,25 @@
  * one personal token with full account rights, so anything else holding that
  * token can still write; this bounds what THIS server will do with it.
  *
+ * Credential handling
+ * -------------------
+ * CLICKUP_API_KEY is a personal token with no scopes: it acts as the user who
+ * created it, across the whole workspace. So it is kept on a short leash.
+ * Native requests are built as URL objects and their origin is checked against
+ * api.clickup.com before the Authorization header is attached; the child
+ * server is resolved from the installed dependency and CLICKUP_MCP_ENTRY may
+ * only point inside it; the child inherits an allowlisted environment rather
+ * than the editor's whole one; and SSE stays off, so nothing listens on a
+ * socket. See SECURITY.md.
+ *
  * MIT licensed, like the upstream server it wraps.
  */
 
 import { spawn } from 'node:child_process';
-import { createInterface } from 'node:readline';
+import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
+import { dirname, resolve as resolvePath, sep } from 'node:path';
+import { createInterface } from 'node:readline';
 
 const require = createRequire(import.meta.url);
 const VERSION = '1.0.0';
@@ -223,12 +236,47 @@ if (missing.length) {
   process.exit(1);
 }
 
-let childEntry;
+// Whatever this process spawns is handed the ClickUp token, so the child is
+// resolved from the installed dependency and nothing else. CLICKUP_MCP_ENTRY
+// remains as an escape hatch for odd install layouts, but it may only point
+// INSIDE that package: an environment variable must not be able to redirect a
+// live credential into arbitrary code.
+const realOf = (path) => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolvePath(path);
+  }
+};
+
+let installedEntry = null;
 try {
-  childEntry =
-    process.env.CLICKUP_MCP_ENTRY ||
-    require.resolve('@twofeetup/clickup-mcp/build/index.js');
+  installedEntry = require.resolve('@twofeetup/clickup-mcp/build/index.js');
 } catch {
+  installedEntry = null;
+}
+
+const entryOverride = String(process.env.CLICKUP_MCP_ENTRY || '').trim();
+let childEntry;
+if (entryOverride && installedEntry) {
+  const packageRoot = realOf(dirname(dirname(installedEntry))) + sep;
+  const candidate = realOf(resolvePath(entryOverride));
+  if (!candidate.startsWith(packageRoot)) {
+    log(
+      `refusing CLICKUP_MCP_ENTRY=${entryOverride}: it points outside the ` +
+        'installed @twofeetup/clickup-mcp, and the child is started with the ' +
+        'ClickUp token. Unset it to use the installed server.',
+    );
+    process.exit(1);
+  }
+  childEntry = candidate;
+} else if (entryOverride) {
+  // The dependency is missing entirely; the override is the only way to start.
+  log('using CLICKUP_MCP_ENTRY: @twofeetup/clickup-mcp is not installed here.');
+  childEntry = resolvePath(entryOverride);
+} else if (installedEntry) {
+  childEntry = installedEntry;
+} else {
   log(
     'could not resolve @twofeetup/clickup-mcp. Reinstall this package so its ' +
       'dependency is present (npx -y github:breckenreed/clickup-mcp-read).',
@@ -236,16 +284,55 @@ try {
   process.exit(1);
 }
 
+// A stdio MCP server inherits the entire environment of the editor that
+// launched it — every other integration's tokens included. The child gets only
+// the variables it actually reads, plus what Node needs to start. NODE_OPTIONS
+// is deliberately absent: it can inject code into the process holding the key.
+//
+// ENABLED_TOOLS and DISABLED_TOOLS are absent on purpose too. Both are read
+// from this process's environment when the policy above is computed, and the
+// child is told the result; passing the raw values through would let the
+// child's own filtering disagree with the policy.
+const CHILD_ENV_KEYS = [
+  // upstream's own configuration
+  'CLICKUP_API_KEY',
+  'CLICKUP_TEAM_ID',
+  'DISABLED_COMMANDS',
+  'DOCUMENT_SUPPORT',
+  'DOCUMENT_MODULE',
+  'DOCUMENT_MODEL',
+  'REQUEST_SPACING',
+  'LOG_LEVEL',
+  // runtime essentials (POSIX and Windows)
+  'PATH',
+  'HOME',
+  'TMPDIR',
+  'TEMP',
+  'TMP',
+  'LANG',
+  'LC_ALL',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'USERPROFILE',
+  'COMSPEC',
+  'PATHEXT',
+];
+
+const childEnv = {};
+for (const key of CHILD_ENV_KEYS) {
+  if (process.env[key] !== undefined) childEnv[key] = process.env[key];
+}
+
 // Layer 1: the child only ever registers the tools that survived the policy,
 // so the write handlers are unreachable even if this proxy were bypassed.
 // An empty ENABLED_TOOLS means "no filter" to upstream — i.e. every tool,
 // writes included — so an empty result has to be spelled as a name that
 // matches nothing rather than as an empty string.
-const childEnv = { ...process.env };
 childEnv.ENABLED_TOOLS = allowedTools.length
   ? allowedTools.join(',')
   : '__clickup_mcp_read_none__';
-delete childEnv.DISABLED_TOOLS; // already folded into ENABLED_TOOLS above
 // stdio only: an inherited ENABLE_SSE must not open a listening socket.
 childEnv.ENABLE_SSE = 'false';
 childEnv.ENABLE_STDIO = 'true';
@@ -405,15 +492,23 @@ const DESCRIPTION_SUFFIXES = {};
 
 // ── ClickUp REST (native tools only) ───────────────────────────────────────
 
-const CLICKUP_API = 'https://api.clickup.com/api/v2';
+const CLICKUP_ORIGIN = 'https://api.clickup.com';
+const CLICKUP_API = `${CLICKUP_ORIGIN}/api/v2`;
 // The task history lives outside the documented API, on the same origin the
 // ClickUp web app itself calls. See the header comment on get_task_activity.
-const CLICKUP_V1 = 'https://api.clickup.com/v1';
+const CLICKUP_V1 = `${CLICKUP_ORIGIN}/v1`;
 
 // The single network path for native tools. GET is hardcoded, and callers only
 // supply a path, so nothing here can become a write.
 async function clickupGet(path, base = CLICKUP_API) {
-  const res = await fetch(`${base}${path}`, {
+  const url = new URL(`${base}${path}`);
+  // A ClickUp personal token carries the whole workspace. Pin it to one
+  // origin, so neither a later edit nor a crafted `base` can send it anywhere
+  // else — the check is the guarantee, not the constant above it.
+  if (url.origin !== CLICKUP_ORIGIN) {
+    throw new Error(`refusing to send ClickUp credentials to ${url.origin}`);
+  }
+  const res = await fetch(url, {
     method: 'GET',
     headers: {
       Authorization: process.env.CLICKUP_API_KEY || '',
