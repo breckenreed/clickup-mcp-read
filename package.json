@@ -10,10 +10,14 @@
   "files": [
     "src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "SECURITY.md"
   ],
   "engines": {
     "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
   },
   "dependencies": {
     "@twofeetup/clickup-mcp": "^1.7.0"
