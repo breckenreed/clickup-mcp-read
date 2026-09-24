@@ -1,7 +1,7 @@
 {
   "name": "clickup-mcp-read",
-  "version": "1.0.0",
-  "description": "Strictly read-only ClickUp MCP server. Wraps @twofeetup/clickup-mcp, removes every write path, and adds get_task_tree and get_task_activity.",
+  "version": "1.1.0",
+  "description": "Strictly read-only ClickUp MCP server. Wraps @twofeetup/clickup-mcp, removes every write path, and adds get_task_tree, get_task_activity, get_task and get_list_statuses.",
   "type": "module",
   "bin": {
     "clickup-mcp-read": "src/index.mjs"

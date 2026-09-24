@@ -89,8 +89,10 @@ test('tools/list returns the read-only set, native tools included', async () => 
   const { replies } = await shared();
   const names = replies.find((r) => r.id === 2).result.tools.map((t) => t.name);
 
-  assert.equal(names.length, 9);
+  assert.equal(names.length, 11);
   for (const expected of [
+    'get_task',
+    'get_list_statuses',
     'get_task_tree',
     'get_task_activity',
     'get_workspace_hierarchy',
@@ -231,14 +233,21 @@ test('ENABLED_TOOLS cannot put a write tool back over the wire', async () => {
 
 test('a native tool reports a missing taskId instead of calling ClickUp', async () => {
   const { replies } = await talk(
-    [call(1, 'get_task_tree', {}), call(2, 'get_task_activity', {})],
-    { expected: 2 },
+    [call(1, 'get_task_tree', {}), call(2, 'get_task_activity', {}), call(3, 'get_task', {})],
+    { expected: 3 },
   );
 
   for (const reply of replies) {
     assert.equal(reply.result.isError, true);
     assert.match(reply.result.content[0].text, /taskId is required/);
   }
+});
+
+test('get_list_statuses reports a missing listId instead of calling ClickUp', async () => {
+  const { replies } = await talk([call(1, 'get_list_statuses', {})], { expected: 1 });
+
+  assert.equal(replies[0].result.isError, true);
+  assert.match(replies[0].result.content[0].text, /listId is required/);
 });
 
 test('a native tool call with no arguments at all is answered, not dropped', async () => {
