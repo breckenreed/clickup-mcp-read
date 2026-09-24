@@ -69,7 +69,7 @@ test('a reading action on an allowed tool proceeds', () => {
   assert.equal(readOnlyRefusal('search_tasks', {}, allowed), null);
 });
 
-test('both native tools are always allowed', () => {
+test('every native tool is always allowed', () => {
   for (const tool of NATIVE_TOOLS) {
     assert.equal(readOnlyRefusal(tool.name, {}, new Map()), null);
   }
@@ -252,4 +252,35 @@ test('coerceArg turns a string into the declared type', () => {
   assert.equal(coerceArg('no', 'boolean'), false);
   assert.equal(coerceArg('15', 'number'), 15);
   assert.deepEqual(coerceArg('status,due_date', 'array'), ['status', 'due_date']);
+});
+
+test('every native tool is annotated read-only', () => {
+  for (const tool of NATIVE_TOOLS) {
+    assert.equal(tool.annotations.readOnlyHint, true, `${tool.name} only reads`);
+    assert.equal(tool.annotations.destructiveHint, false, `${tool.name} deletes nothing`);
+  }
+});
+
+test('the task read does not advertise itself as a step before a write', () => {
+  const getTask = NATIVE_TOOLS.find((t) => t.name === 'get_task');
+  assert.doesNotMatch(getTask.description, /rewrit|replac/i);
+});
+
+test('normaliseArgs reads a bare id as whichever id the tool declares', () => {
+  const { args } = normaliseArgs('get_list_statuses', { id: '900100' });
+
+  assert.equal(args.listId, '900100');
+  assert.equal(args.taskId, undefined);
+  assert.equal(normaliseArgs('get_list_statuses', { list_id: '9' }).args.listId, '9');
+  assert.equal(normaliseArgs('get_task', { task_id: 'abc' }).args.taskId, 'abc');
+});
+
+test('get_container points to get_list_statuses, keeping upstream text', () => {
+  const [tool] = decorateChildTools(
+    [{ name: 'get_container', description: 'Upstream text.' }],
+    allow(),
+  );
+
+  assert.ok(tool.description.startsWith('Upstream text.'));
+  assert.match(tool.description, /get_list_statuses/);
 });

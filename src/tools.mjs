@@ -8,6 +8,68 @@
 
 export const NATIVE_TOOLS = [
   {
+    name: 'get_task',
+    description:
+      'Read ONE task in full, as a compact card (READ-ONLY): the whole ' +
+      'description as markdown, status and priority, list and parent, ' +
+      'assignees and watchers, created/start/due/closed dates, time estimate ' +
+      'and tracked time, tags, every custom field that has a value (drop-down ' +
+      'and label values resolved to their names), checklists with their ' +
+      'items, dependencies, linked tasks, attachments, and the statuses the ' +
+      'task\'s list allows. Use this whenever you need the details or the ' +
+      'description of a known task.',
+    annotations: {
+      title: 'One task in full',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        taskId: {
+          type: 'string',
+          description:
+            'REQUIRED: id of the task, e.g. "86capt3b". A prefixed custom id ' +
+            'like "DEV-123" works too.',
+        },
+        include_list_statuses: {
+          type: 'boolean',
+          description:
+            'Also list the statuses available in the task\'s list (one extra ' +
+            'request, default: true)',
+        },
+      },
+      required: ['taskId'],
+    },
+  },
+  {
+    name: 'get_list_statuses',
+    description:
+      'List every status a ClickUp list allows, in board order, with its ' +
+      'type (open, custom, done, closed) (READ-ONLY). Use this before ' +
+      'filtering search_tasks by status: status names are per list and ' +
+      'must match exactly, and get_container does not return them.',
+    annotations: {
+      title: 'Statuses of a list',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        listId: {
+          type: 'string',
+          description: 'REQUIRED: id of the list, e.g. "901234567890".',
+        },
+      },
+      required: ['listId'],
+    },
+  },
+  {
     name: 'get_task_tree',
     description:
       'Read a task together with ALL its nested subtasks, at every depth, in ' +
@@ -214,6 +276,8 @@ export const DESCRIPTION_OVERRIDES = {
     '(3) Across the workspace: pass at least one real filter (tags, statuses, ' +
     'assignees, list_ids, folder_ids, space_ids, or a date filter). A task id ' +
     'is NOT a filter.\n' +
+    'For the full details or description of one known task, prefer get_task, ' +
+    'which returns a compact card instead of the raw object.\n' +
     'For the subtasks of a task do NOT use this tool — call get_task_tree, ' +
     'which returns the whole nested tree in one compact call.',
   task_comments:
@@ -244,6 +308,14 @@ export const DESCRIPTION_OVERRIDES = {
     'Read the pages of a ClickUp document (READ-ONLY, despite the name). Two ' +
     'actions: "list" for the page index of a document, and "get" for the ' +
     'content of one or more pages. This server cannot create or edit pages.',
+};
+
+// Appended, not replaced: upstream's own text is still accurate for these, and
+// only the routing hint is missing.
+export const DESCRIPTION_SUFFIXES = {
+  get_container:
+    '\n\nNOTE: the statuses of a list are not part of this response — call ' +
+    'get_list_statuses for them.',
 };
 
 // ── Tool annotations ───────────────────────────────────────────────────────
@@ -337,11 +409,14 @@ export function decorateChildTools(tools, allowed = new Map()) {
     .map((tool) => {
       const decorated = applyReadOnlySchema(tool, allowed.get(tool.name));
       const override = DESCRIPTION_OVERRIDES[tool.name];
+      const suffix = DESCRIPTION_SUFFIXES[tool.name];
       const defaults = TOOL_ANNOTATIONS[tool.name];
-      if (!override && !defaults) return decorated;
+      if (!override && !suffix && !defaults) return decorated;
 
       const out = { ...decorated };
-      if (override) out.description = override;
+      if (override || suffix) {
+        out.description = `${override ?? decorated.description ?? ''}${suffix ?? ''}`;
+      }
       if (defaults) out.annotations = { ...defaults, ...(tool.annotations || {}) };
       return out;
     });
@@ -353,7 +428,7 @@ export function decorateChildTools(tools, allowed = new Map()) {
 // call is checked, including for tools the child would happily run: a client
 // can name a tool it was never offered in tools/list.
 export function readOnlyRefusal(name, args, allowed = new Map()) {
-  if (NATIVE_TOOL_NAMES.has(name)) return null; // both native tools only read
+  if (NATIVE_TOOL_NAMES.has(name)) return null; // the native tools only read
 
   const policy = allowed.get(name);
   if (!policy) {
@@ -397,8 +472,14 @@ export function readOnlyRefusal(name, args, allowed = new Map()) {
 
 export const foldKey = (key) => String(key).toLowerCase().replace(/[^a-z0-9]/g, '');
 
-// Spellings that do not fold to the canonical name on their own.
-export const ARG_SYNONYMS = { id: 'taskId', task: 'taskId' };
+// Spellings that do not fold to the canonical name on their own. Each maps to
+// candidates in order; the first one the tool actually declares wins, so a
+// bare `id` is a taskId for the task tools and a listId for the list one.
+export const ARG_SYNONYMS = {
+  id: ['taskId', 'listId'],
+  task: ['taskId'],
+  list: ['listId'],
+};
 
 const NATIVE_ARG_SPECS = new Map(
   NATIVE_TOOLS.map((tool) => {
@@ -438,7 +519,9 @@ export function normaliseArgs(name, args) {
   const renamed = [];
   for (const [key, value] of Object.entries(args)) {
     const fold = foldKey(key);
-    const canonical = spec.byFold.get(fold) || ARG_SYNONYMS[fold];
+    const canonical =
+      spec.byFold.get(fold) ||
+      (ARG_SYNONYMS[fold] || []).find((name) => name in spec.props);
     if (!canonical) {
       out[key] = value; // unknown key: hand it over untouched
       continue;

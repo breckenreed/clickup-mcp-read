@@ -2,9 +2,9 @@
  * Pure rendering helpers for the native tools.
  *
  * Everything here is a plain function over plain data: no network, no process
- * state. get_task_tree and get_task_activity do their I/O in index.mjs and
- * hand the results to these, which is what makes both tools testable without
- * a ClickUp workspace (see test/format.test.mjs).
+ * state. The native tools do their I/O in index.mjs and hand the results to
+ * these, which is what makes them testable without a ClickUp workspace (see
+ * test/format.test.mjs).
  */
 
 // ClickUp names history entries by the field they touched. Anything not listed
@@ -225,4 +225,164 @@ export function renderTree(root, childrenBy, maxDepth) {
   walk(root, 0);
   const summary = [...tally.entries()].map(([s, n]) => `${s}: ${n}`).join(', ');
   return { text: lines.join('\n'), count, summary };
+}
+
+// ── get_task ───────────────────────────────────────────────────────────────
+
+const PRIORITY_NAMES = { 1: 'urgent', 2: 'high', 3: 'normal', 4: 'low' };
+
+// A custom field's value is stored in whatever shape its type dictates, and
+// the option-backed types store a pointer rather than the label: a drop-down
+// holds the option's orderindex (or, on some workspaces, its id), labels hold
+// option ids. Resolve those against type_config so the reader sees words.
+// Returns null for an unset field, so the caller can leave it out.
+export function customFieldValue(field) {
+  const value = field?.value;
+  if (value === undefined || value === null || value === '') return null;
+  if (Array.isArray(value) && value.length === 0) return null;
+  const options = field?.type_config?.options || [];
+  const optionLabel = (ref) => {
+    const hit = options.find(
+      (o) => o.id === ref || (o.orderindex !== undefined && String(o.orderindex) === String(ref)),
+    );
+    return hit ? hit.name ?? hit.label ?? String(ref) : String(ref);
+  };
+
+  switch (field.type) {
+    case 'drop_down':
+      return optionLabel(value);
+    case 'labels':
+      return [].concat(value).map(optionLabel).join(', ');
+    case 'date':
+      return formatStamp(value);
+    case 'checkbox':
+      return value === true || value === 'true' ? 'yes' : 'no';
+    case 'users':
+    case 'people':
+      return [].concat(value).map(actorName).join(', ');
+    case 'tasks':
+      return [].concat(value).map((t) => (t?.name ? `${t.name} (${t.id})` : String(t?.id ?? t))).join(', ');
+    case 'automatic_progress':
+    case 'manual_progress':
+      return value?.percent_complete !== undefined ? `${value.percent_complete}%` : clip(JSON.stringify(value), 120);
+    case 'location':
+      return value?.formatted_address || clip(JSON.stringify(value), 120);
+    default:
+      if (typeof value === 'object') return valueLabel(field.type, value);
+      return String(value);
+  }
+}
+
+const joinNames = (people) =>
+  (people || []).map(actorName).filter(Boolean).join(', ');
+
+// A dependency row names both ends; which one is "the other task" depends on
+// which side this task is on.
+function relationLines(task) {
+  const lines = [];
+  const waitingOn = [];
+  const blocking = [];
+  for (const dep of task.dependencies || []) {
+    if (dep?.task_id === task.id && dep.depends_on) waitingOn.push(dep.depends_on);
+    else if (dep?.depends_on === task.id && dep.task_id) blocking.push(dep.task_id);
+  }
+  if (waitingOn.length) lines.push(`Waiting on: ${waitingOn.join(', ')}`);
+  if (blocking.length) lines.push(`Blocking: ${blocking.join(', ')}`);
+  const linked = (task.linked_tasks || [])
+    .map((l) => (l?.task_id === task.id ? l.link_id : l?.task_id))
+    .filter(Boolean);
+  if (linked.length) lines.push(`Linked tasks: ${linked.join(', ')}`);
+  return lines;
+}
+
+export function renderStatuses(statuses) {
+  return [...(statuses || [])]
+    .sort((a, b) => (a?.orderindex ?? 0) - (b?.orderindex ?? 0))
+    .map((s) => `${s.status}${s.type ? ` (${s.type})` : ''}`);
+}
+
+// One task, every field an agent reads before acting on it, as a compact
+// card rather than the raw object: the raw read repeats the description
+// twice, carries every unset custom field and every avatar URL, and leaves
+// drop-down values as bare numbers. `statuses`, when given, are the statuses
+// of the task's list — what a status change may be set to.
+export function renderTaskCard(task, { statuses } = {}) {
+  const out = [];
+  const custom = task.custom_id ? ` (${task.custom_id})` : '';
+  out.push(`Task ${task.id}${custom}: ${task.name}`);
+  if (task.url) out.push(`URL: ${task.url}`);
+
+  const priority = task.priority?.priority ?? PRIORITY_NAMES[task.priority?.id];
+  out.push(
+    `Status: ${task.status?.status || 'no status'}` +
+      (priority ? `   Priority: ${priority}` : '') +
+      (task.archived ? '   (archived)' : ''),
+  );
+
+  const where = [
+    task.list?.name ? `List: ${task.list.name} (${task.list.id})` : null,
+    task.folder?.name && !task.folder.hidden ? `Folder: ${task.folder.name}` : null,
+  ].filter(Boolean);
+  if (where.length) out.push(where.join('   '));
+  if (task.parent) out.push(`Parent task: ${task.parent}`);
+  if (Array.isArray(task.subtasks)) {
+    out.push(`Subtasks: ${task.subtasks.length} direct (get_task_tree for all levels)`);
+  }
+
+  const assignees = joinNames(task.assignees);
+  out.push(`Assignees: ${assignees || 'none'}`);
+  const watchers = joinNames(task.watchers);
+  if (watchers) out.push(`Watchers: ${watchers}`);
+
+  out.push(
+    `Created: ${formatStamp(task.date_created)}` +
+      (task.creator ? ` by ${actorName(task.creator)}` : '') +
+      (task.date_updated ? `   Updated: ${formatStamp(task.date_updated)}` : ''),
+  );
+  const dates = [
+    asMillis(task.start_date) ? `Start: ${formatStamp(task.start_date)}` : null,
+    asMillis(task.due_date) ? `Due: ${formatStamp(task.due_date)}` : null,
+    asMillis(task.date_closed) ? `Closed: ${formatStamp(task.date_closed)}` : null,
+  ].filter(Boolean);
+  if (dates.length) out.push(dates.join('   '));
+
+  const effort = [
+    asMillis(task.time_estimate) ? `Time estimate: ${formatDuration(task.time_estimate)}` : null,
+    asMillis(task.time_spent) ? `Time tracked: ${formatDuration(task.time_spent)}` : null,
+    task.points !== null && task.points !== undefined ? `Points: ${task.points}` : null,
+  ].filter(Boolean);
+  if (effort.length) out.push(effort.join('   '));
+
+  const tags = (task.tags || []).map((t) => t?.name).filter(Boolean);
+  if (tags.length) out.push(`Tags: ${tags.join(', ')}`);
+
+  const fields = (task.custom_fields || [])
+    .map((f) => [f?.name, customFieldValue(f)])
+    .filter(([, v]) => v !== null);
+  if (fields.length) {
+    out.push('Custom fields:');
+    for (const [name, value] of fields) out.push(`  ${name}: ${value}`);
+  }
+
+  for (const list of task.checklists || []) {
+    const items = list?.items || [];
+    const done = items.filter((i) => i?.resolved).length;
+    out.push(`Checklist "${list?.name}" (${done}/${items.length}):`);
+    for (const item of items) out.push(`  [${item?.resolved ? 'x' : ' '}] ${item?.name}`);
+  }
+
+  out.push(...relationLines(task));
+
+  const files = (task.attachments || []).filter((a) => a && !a.deleted);
+  if (files.length) {
+    out.push(`Attachments: ${files.map((a) => a.title || a.id).join(', ')}`);
+  }
+
+  if (statuses?.length) {
+    out.push(`Statuses in this list: ${renderStatuses(statuses).join(', ')}`);
+  }
+
+  const description = task.markdown_description ?? task.description ?? task.text_content ?? '';
+  out.push('', 'Description:', description.trim() ? description.trim() : '(empty)');
+  return out.join('\n');
 }

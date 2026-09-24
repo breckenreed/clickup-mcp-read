@@ -1,8 +1,8 @@
 # clickup-mcp-read
 
 A **strictly read-only** ClickUp MCP server. It answers questions about a
-workspace — including a whole nested subtask tree, or a task's whole activity
-history, in **one call** — and it cannot change anything.
+workspace — including a whole nested subtask tree, a task's whole activity
+history, or one task in full, in **one call** — and it cannot change anything.
 
 [![M8ven Trust Score](https://m8ven.ai/badge/mcp/breckenreed-clickup-mcp-read-ynm8b8)](https://m8ven.ai/mcp/breckenreed-clickup-mcp-read-ynm8b8)
 
@@ -113,6 +113,47 @@ Narrow it with `fields` (raw ClickUp field names: `status`, `due_date`,
 `assignee_add`, `tag`, `custom_field`, ...), `since` (ISO date or millisecond
 timestamp), `limit`, `include_comments` and `oldest_first`. Timestamps are UTC.
 
+## Why the full-task read
+
+Upstream reads one task through `search_tasks` with `detail_level: "detailed"`,
+which returns the raw ClickUp object: the description twice (plain and rich),
+every custom field whether it is set or not, drop-down values as bare numbers,
+avatar URLs, sharing settings. The answer to "what does this task say" is in
+there, but an agent pays for all of the rest in context.
+
+`get_task` returns the same task as a card: the fields an agent reads before
+acting on a task, set custom fields only, option values resolved to their
+names, checklists with their items, dependencies in both directions, the
+statuses its list allows, and the full description as markdown, last.
+
+```
+Task 86capt3b (DEV-12): Migrate billing service
+URL: https://app.clickup.com/t/86capt3b
+Status: in progress   Priority: high
+List: Q3 Delivery (900100)   Folder: Platform
+Subtasks: 3 direct (get_task_tree for all levels)
+Assignees: ivan
+Created: 2026-03-01 10:00 by olena   Updated: 2026-03-06 12:00
+Start: 2026-03-02 09:00   Due: 2026-03-24 12:00
+Time estimate: 4h   Time tracked: 1h 30m
+Tags: billing
+Custom fields:
+  Stage: Build
+Checklist "Cutover" (1/2):
+  [x] Freeze writes
+  [ ] Switch DNS
+Waiting on: 86captk9
+Statuses in this list: to do (open), in progress (custom), complete (closed)
+
+Description:
+## Goal
+
+Move billing off the monolith.
+```
+
+Status names are per list and must match exactly when filtering by them, and upstream's `get_container` does not return them, so
+`get_list_statuses` does, in board order and with their type.
+
 ## Install
 
 Nothing to clone or build. Point your agent at the package and it is fetched on
@@ -186,7 +227,7 @@ is asserted by the tests in `test/`. See [SECURITY.md](SECURITY.md).
 - **One origin.** Every request the native tools make is built as a `URL` and
   checked against `https://api.clickup.com` before the `Authorization` header
   is attached. A request to any other origin throws instead of being sent.
-- **Read-only native path.** `get_task_tree` and `get_task_activity` share a
+- **Read-only native path.** All four native tools share a
   single helper with the method hardcoded to `GET`; callers pass a path, never
   a method or a host.
 - **A trimmed child environment.** The upstream server runs as a child process
@@ -208,10 +249,12 @@ is asserted by the tests in `test/`. See [SECURITY.md](SECURITY.md).
 
 ## Tools
 
-Every tool here is read-only. Nine are exposed by default.
+Every tool here is read-only. Eleven are exposed by default.
 
 | Tool | What it does |
 |---|---|
+| `get_task` | One task in full: description, fields, checklists, list statuses |
+| `get_list_statuses` | Every status a list allows, in board order |
 | `get_task_tree` | Task plus all nested subtasks, any depth, one call |
 | `get_task_activity` | Full history of a task: system events plus comments |
 | `get_workspace_hierarchy` | Spaces, folders, lists as a tree |
@@ -232,7 +275,7 @@ Upstream's `manage_task`, `manage_container`, `attach_file_to_task` and
 
 | Variable | Default | Effect |
 |---|---|---|
-| `ENABLED_TOOLS` | the nine tools above | Comma-separated allowlist. May only **narrow** the read-only set; write tools listed here are ignored with a warning on stderr. `get_task_tree` and `get_task_activity` are implemented here, so they are always available. |
+| `ENABLED_TOOLS` | the tools above | Comma-separated allowlist. May only **narrow** the read-only set; write tools listed here are ignored with a warning on stderr. The four native tools (`get_task`, `get_list_statuses`, `get_task_tree`, `get_task_activity`) are implemented here, so they are always available. |
 | `DISABLED_TOOLS` | unset | Comma-separated blocklist. Only ever subtracts. |
 | `REQUEST_SPACING` | `100` | Milliseconds between ClickUp API calls. See below. |
 | `DOCUMENT_SUPPORT` | `false` | `true` exposes the two read-only document tools. |
@@ -257,9 +300,9 @@ from their parent, those will not appear, and the server falls back to the
 direct children reported by the task endpoint. Open an issue if you hit this
 and it matters.
 
-**Argument spellings are forgiving.** `get_task_tree` and `get_task_activity`
-accept `task_id`, `taskid`, a bare `id` or `task` wherever the schema says
-`taskId`, and the same folding applies to every other argument (`maxDepth` for
+**Argument spellings are forgiving.** The native tools accept `task_id`,
+`taskid`, a bare `id` or `task` wherever the schema says `taskId` (and
+`list_id`, `list` or a bare `id` for `get_list_statuses`), and the same folding applies to every other argument (`maxDepth` for
 `max_depth`, `includeComments` for `include_comments`). Values are coerced to
 the declared type, so `"true"`, `"15"` and `"status,due_date"` work where a
 boolean, a number and an array are expected. Smaller models get these wrong
@@ -308,7 +351,8 @@ npm test
 ```
 
 `test/format.test.mjs` and `test/tools.test.mjs` cover the tree assembly, the
-activity rendering, the argument normalisation, and the read-only policy as
+activity rendering, the task card and custom-field resolution, the argument
+normalisation, and the read-only policy as
 plain functions — every write tool and every write action, checked by name.
 `test/server.test.mjs` spawns the server the way a host does and drives it over
 stdio: the handshake, the tool list, the pruned schemas, the refusals, the

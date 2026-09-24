@@ -27,7 +27,8 @@ else holding that token can change the workspace.
   as `URL` objects and the origin is compared to that constant *before* the
   `Authorization` header is attached; anything else throws
   (`src/index.mjs`, `clickupGet`).
-- The native tools (`get_task_tree`, `get_task_activity`) issue `GET` only. The
+- The native tools (`get_task`, `get_list_statuses`, `get_task_tree`,
+  `get_task_activity`) issue `GET` only. The
   method is hardcoded in the one helper they share, which takes a path rather
   than a method or a host.
 - The child process (`@twofeetup/clickup-mcp`) is resolved from this package's
