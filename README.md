@@ -73,9 +73,9 @@ Task tree for 86capt3b: 23 task(s) including the root.
 Statuses: in progress: 3, open: 14, complete: 6
 List: Q3 Delivery
 
-86capt3b  [in progress]  Migrate billing service  <ivan>
-  86captk1  [complete]  Audit current schema  <olena>
-  86captk2  [in progress]  Write migration scripts  <ivan>
+86capt3b  [in progress]  Migrate billing service  <alex>
+  86captk1  [complete]  Audit current schema  <jamie>
+  86captk2  [in progress]  Write migration scripts  <alex>
     86captm7  [open]  Handle partial refunds
     86captm8  [open]  Backfill historical rows
   86captk3  [open]  Cutover plan
@@ -100,13 +100,13 @@ Activity for 86capt3b (DEV-12): Migrate billing service
 7 event(s).
 Kinds: Comment: 2, Due date: 1, Tags: 1, Assignee added: 1, Status: 1, Custom field: 1
 
-2026-03-06 12:00  ivan  —  Cutover moved to next week.
-2026-03-05 09:00  ivan  —  Due date: 2026-03-10 12:00 → 2026-03-24 12:00
-2026-03-04 15:30  olena  —  Tags: blocked, billing
-2026-03-04 11:05  olena  —  Assignee added: ivan
-2026-03-03 08:00  ivan  —  Status: to do → in progress
-2026-03-02 17:45  olena  —  Schema audit done, moving on.
-2026-03-01 10:00  ivan  —  Custom field "Sprint": S-14
+2026-03-06 12:00  alex  —  Cutover moved to next week.
+2026-03-05 09:00  alex  —  Due date: 2026-03-10 12:00 → 2026-03-24 12:00
+2026-03-04 15:30  jamie  —  Tags: blocked, billing
+2026-03-04 11:05  jamie  —  Assignee added: alex
+2026-03-03 08:00  alex  —  Status: to do → in progress
+2026-03-02 17:45  jamie  —  Schema audit done, moving on.
+2026-03-01 10:00  alex  —  Custom field "Sprint": S-14
 ```
 
 Narrow it with `fields` (raw ClickUp field names: `status`, `due_date`,
@@ -132,8 +132,8 @@ URL: https://app.clickup.com/t/86capt3b
 Status: in progress   Priority: high
 List: Q3 Delivery (900100)   Folder: Platform
 Subtasks: 3 direct (get_task_tree for all levels)
-Assignees: ivan
-Created: 2026-03-01 10:00 by olena   Updated: 2026-03-06 12:00
+Assignees: alex
+Created: 2026-03-01 10:00 by jamie   Updated: 2026-03-06 12:00
 Start: 2026-03-02 09:00   Due: 2026-03-24 12:00
 Time estimate: 4h   Time tracked: 1h 30m
 Tags: billing

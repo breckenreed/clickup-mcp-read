@@ -45,13 +45,13 @@ test('renderTree nests every level, not just the direct children', () => {
 test('renderTree tallies statuses and renders assignees and custom ids', () => {
   const root = task('a', 'root', null, {
     custom_id: 'DEV-1',
-    assignees: [{ username: 'olena' }, { email: 'ivan@example.com' }],
+    assignees: [{ username: 'jamie' }, { email: 'alex@example.com' }],
   });
   const pool = [root, task('b', 'child', 'a', { status: { status: 'complete' } })];
   const { text, summary, count } = renderTree(root, indexByParent(pool), 10);
 
   assert.equal(count, 2);
-  assert.match(text, /a \(DEV-1\) {2}\[open] {2}root {2}<olena, ivan@example\.com>/);
+  assert.match(text, /a \(DEV-1\) {2}\[open] {2}root {2}<jamie, alex@example\.com>/);
   assert.match(summary, /open: 1/);
   assert.match(summary, /complete: 1/);
 });
@@ -84,7 +84,7 @@ test('indexByParent ignores tasks with no parent', () => {
 test('valueLabel reduces the shapes ClickUp history actually returns', () => {
   assert.equal(valueLabel('status', { status: 'in progress' }), 'in progress');
   assert.equal(valueLabel('tag', [{ name: 'blocked' }, { name: 'billing' }]), 'blocked, billing');
-  assert.equal(valueLabel('assignee_add', { username: 'ivan' }), 'ivan');
+  assert.equal(valueLabel('assignee_add', { username: 'alex' }), 'alex');
   assert.equal(valueLabel('status', null), 'none');
   assert.equal(valueLabel('tag', []), 'none');
   assert.equal(valueLabel('due_date', '1772496000000'), formatStamp('1772496000000'));
@@ -110,8 +110,8 @@ test('commentText reads both comment shapes', () => {
 });
 
 test('actorName falls back through username, email, id', () => {
-  assert.equal(actorName({ username: 'olena' }), 'olena');
-  assert.equal(actorName({ email: 'ivan@example.com' }), 'ivan@example.com');
+  assert.equal(actorName({ username: 'jamie' }), 'jamie');
+  assert.equal(actorName({ email: 'alex@example.com' }), 'alex@example.com');
   assert.equal(actorName({ id: 7 }), 'user 7');
   assert.equal(actorName(undefined), 'unknown');
 });
@@ -120,12 +120,12 @@ test('normaliseHistoryEntry renders a change as before → after', () => {
   const event = normaliseHistoryEntry({
     field: 'status',
     date: '1772496000000',
-    user: { username: 'ivan' },
+    user: { username: 'alex' },
     before: { status: 'to do' },
     after: { status: 'in progress' },
   });
 
-  assert.equal(event.who, 'ivan');
+  assert.equal(event.who, 'alex');
   assert.equal(event.detail, 'Status: to do → in progress');
   assert.equal(event.commentId, null);
 });
@@ -134,7 +134,7 @@ test('normaliseHistoryEntry does not render "none →" for additive events', () 
   const event = normaliseHistoryEntry({
     field: 'tag',
     date: '1772496000000',
-    user: { username: 'olena' },
+    user: { username: 'jamie' },
     after: [{ name: 'blocked' }],
   });
 
@@ -156,7 +156,7 @@ test('normaliseHistoryEntry carries the comment id, for de-duplication', () => {
   const event = normaliseHistoryEntry({
     field: 'comment',
     date: '1',
-    user: { username: 'ivan' },
+    user: { username: 'alex' },
     comment: { id: 42, comment_text: 'moving on' },
   });
 
@@ -198,7 +198,7 @@ test('customFieldValue resolves labels, dates, people, tasks and progress', () =
   };
   assert.equal(customFieldValue(labels), 'backend, urgent');
   assert.equal(customFieldValue({ type: 'date', value: '1772496000000' }), '2026-03-03 00:00');
-  assert.equal(customFieldValue({ type: 'users', value: [{ username: 'olena' }] }), 'olena');
+  assert.equal(customFieldValue({ type: 'users', value: [{ username: 'jamie' }] }), 'jamie');
   assert.equal(
     customFieldValue({ type: 'tasks', value: [{ id: '86captk1', name: 'Audit schema' }] }),
     'Audit schema (86captk1)',
@@ -238,9 +238,9 @@ const fullTask = () => ({
   folder: { name: 'Platform', hidden: false },
   parent: '86capt00',
   subtasks: [{ id: '86captk1' }, { id: '86captk2' }],
-  assignees: [{ username: 'ivan' }],
-  watchers: [{ username: 'olena' }],
-  creator: { username: 'olena' },
+  assignees: [{ username: 'alex' }],
+  watchers: [{ username: 'jamie' }],
+  creator: { username: 'jamie' },
   date_created: '1772359200000',
   due_date: '1773316800000',
   time_estimate: 14400000,
@@ -278,8 +278,8 @@ test('renderTaskCard shows every field an agent reads before acting', () => {
   assert.match(card, /^List: Q3 Delivery \(900100\) {3}Folder: Platform$/m);
   assert.match(card, /^Parent task: 86capt00$/m);
   assert.match(card, /^Subtasks: 2 direct/m);
-  assert.match(card, /^Assignees: ivan$/m);
-  assert.match(card, /^Created: 2026-03-01 10:00 by olena$/m);
+  assert.match(card, /^Assignees: alex$/m);
+  assert.match(card, /^Created: 2026-03-01 10:00 by jamie$/m);
   assert.match(card, /Due: 2026-03-12 12:00/);
   assert.match(card, /^Time estimate: 4h {3}Time tracked: 1h 30m$/m);
   assert.match(card, /^Tags: billing$/m);
